@@ -38,7 +38,7 @@ class SceneParameters:
     
 @dataclass
 class RobotParameters:
-    number_robots: int = 6
+    number_robots: int = 10
     kinematics: str = 'omni'
     shape: str = 'circle'
     radius: float = 0.1
@@ -50,7 +50,7 @@ class RobotParameters:
     lidar_number: int = 200
 
     single_max_timestep: int = 1000   # 每个机器人单次任务的最大时间步数
-    move_single_step: float = 0.0025  # 每个时间步机器人的最大移动距离
+    move_single_step: float = 0.1  # 每个时间步机器人的最大移动距离
 
 @dataclass
 class RLFieldsConfig:
@@ -60,10 +60,10 @@ class RLFieldsConfig:
     neighbor_hidden_size: int = 128
     neighbor_base_channels: int = 32
     obstacle_embedding_dim: int = 128
-    n_head: int = 6
-    num_use_neighbor_obs: int = 6    # 使用固定范围的最近几个机器人作为邻居观察
+    n_head: int = 3
+    num_use_neighbor_obs: int = 3    # 使用固定范围的最近几个机器人作为邻居观察
     env_output_feature: int = 128
-    fusion_mode: str = "film"
+    fusion_mode: str = "concat"
     # -------- NTFields 配置 --------
     nt_dim: int = 2
     nt_vmax: float = 1.0
@@ -87,6 +87,30 @@ class ExprimentConfig:
     env_yaml_path: str = 'config/random_env.yaml'
     disable_plotting: bool = False
     ckpt_save_interval: int = 10
+    restore_ckpt_path: str = None
+
+    num_env_runners: int = 1
+    num_envs_per_env_runner: int = 1
+    num_cpus_per_env_runner: int = 10
+    num_gpus_per_env_runner: int = 0.5
+    rollout_fragment_length: int = 200
+    num_cpus_for_main_process: int = 8
+
+@dataclass
+class AlgorithmConfig:
+    lr: float = 1e-4
+    train_batch_size: int = 400
+    use_gae: bool = True
+    lambda_: float = 0.95
+    use_critic: bool = True
+    use_kl_loss: bool = True
+    kl_coeff: float = 0.2
+    kl_target: float = 0.02
+    entropy_coeff: float = 0.005
+    vf_loss_coeff: float = 1.0
+    vf_clip_param: float = 10.0
+    clip_param: float = 0.2
+    grad_clip: float = 1.0
 
 @dataclass
 class SceneConfig:
@@ -96,6 +120,7 @@ class SceneConfig:
     network_params : RLFieldsConfig = RLFieldsConfig()
     reward_params : RewardConfig = RewardConfig()
     experiment_params : ExprimentConfig = ExprimentConfig()
+    algorithm_params : AlgorithmConfig = AlgorithmConfig()
 
     def get_env_config(self) -> Dict[str, Any]:
         """給 env_config."""

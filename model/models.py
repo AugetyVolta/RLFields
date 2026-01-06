@@ -249,7 +249,7 @@ class FiLM1d(nn.Module):
         super().__init__()
         self.feat_dim = feat_dim
         self.proj = nn.Linear(cond_dim, 2 * feat_dim)
-        nn.init.zeros_(self.proj.weight)
+        nn.init.xavier_uniform_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
         self.gamma_scale = gamma_scale
         self.beta_scale = beta_scale
@@ -263,37 +263,92 @@ class FiLM1d(nn.Module):
 
 class LateFusionHead(nn.Module):
     """
-    将 trunk 向量特征 z 与条件嵌入 c 在“后连接”处融合。
     mode:
-      - 'film'  : 1D-FiLM 残差插值 (恒等安全)
-      - 'gated' : 乘法门控残差 (恒等安全)
-      - 'concat': 拼接后 MLP
+      - 'film'
+      - 'film_no_res'
+      - 'gated'
+      - 'sigmoid'
+      - 'concat'
+      - 'concat_ln'   # NEW: 分别 LN 后再 concat
     """
-    def __init__(self, z_dim: int, c_dim: int, out_dim: int, mode: str = "film"):
+    def __init__(
+        self,
+        z_dim: int,
+        c_dim: int,
+        out_dim: int,
+        mode: str = "film",
+        gate_bias_init: float = 2.0,
+        gate_hidden: int = 256,
+    ):
         super().__init__()
         self.mode = mode.lower()
-        assert self.mode in ("film", "gated", "concat")
+        assert self.mode in (
+            "film", "gated", "concat", "film_no_res", "sigmoid", "concat_ln"
+        ), f"未知融合模式: {self.mode}"
 
         if self.mode == "film":
             self.film = FiLM1d(z_dim, c_dim, gamma_scale=0.1, beta_scale=0.1)
-            self.alpha = nn.Parameter(torch.tensor(0.0))  # 残差系数，0 起步=恒等
+            self.alpha = nn.Parameter(torch.tensor(0.1))
             self.post = nn.Sequential(
                 nn.LayerNorm(z_dim), nn.ReLU(inplace=True),
-                nn.Linear(z_dim, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True)
+                nn.Linear(z_dim, out_dim), nn.LayerNorm(out_dim),
+                nn.ReLU(inplace=True), nn.Linear(out_dim, out_dim)
             )
+
+        elif self.mode == "film_no_res":
+            self.film = FiLM1d(z_dim, c_dim, gamma_scale=0.1, beta_scale=0.1)
+            self.post = nn.Sequential(
+                nn.LayerNorm(z_dim), nn.ReLU(inplace=True),
+                nn.Linear(z_dim, out_dim), nn.LayerNorm(out_dim),
+                nn.ReLU(inplace=True), nn.Linear(out_dim, out_dim)
+            )
+
         elif self.mode == "gated":
             self.gate = nn.Linear(c_dim, z_dim)
-            nn.init.zeros_(self.gate.weight)
-            nn.init.zeros_(self.gate.bias)  # 恒等起点
-            self.alpha = nn.Parameter(torch.tensor(0.0))
+            nn.init.xavier_uniform_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
+            self.alpha = nn.Parameter(torch.tensor(0.1))
             self.post = nn.Sequential(
                 nn.LayerNorm(z_dim), nn.ReLU(inplace=True),
-                nn.Linear(z_dim, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True)
+                nn.Linear(z_dim, out_dim), nn.LayerNorm(out_dim),
+                nn.ReLU(inplace=True), nn.Linear(out_dim, out_dim)
             )
+
+        elif self.mode == "sigmoid":
+            gate_in = z_dim + c_dim
+            self.gate = nn.Sequential(
+                nn.LayerNorm(gate_in),
+                nn.Linear(gate_in, gate_hidden),
+                nn.SiLU(),
+                nn.Linear(gate_hidden, z_dim),
+            )
+            nn.init.constant_(self.gate[-1].bias, gate_bias_init)
+
+            self.c_proj = nn.Linear(c_dim, z_dim)
+            nn.init.xavier_uniform_(self.c_proj.weight)
+            nn.init.zeros_(self.c_proj.bias)
+
+            self.post = nn.Sequential(
+                nn.LayerNorm(z_dim), nn.ReLU(inplace=True),
+                nn.Linear(z_dim, out_dim), nn.LayerNorm(out_dim),
+                nn.ReLU(inplace=True), nn.Linear(out_dim, out_dim)
+            )
+
+        elif self.mode == "concat_ln":
+            # 分别对两路做 LayerNorm，再 concat
+            self.z_ln = nn.LayerNorm(z_dim)
+            self.c_ln = nn.LayerNorm(c_dim)
+            self.post = nn.Sequential(
+                nn.Linear(z_dim + c_dim, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
+                nn.Linear(512, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True),
+                nn.Linear(out_dim, out_dim)
+            )
+
         else:  # concat
             self.post = nn.Sequential(
                 nn.Linear(z_dim + c_dim, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
-                nn.Linear(512, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True)
+                nn.Linear(512, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True),
+                nn.Linear(out_dim, out_dim)
             )
 
     def forward(self, z: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -301,11 +356,29 @@ class LateFusionHead(nn.Module):
             z_tilde = self.film(z, c)
             z = z + self.alpha * (z_tilde - z)
             return self.post(z)
+
+        elif self.mode == "film_no_res":
+            z_tilde = self.film(z, c)
+            return self.post(z_tilde)
+
         elif self.mode == "gated":
-            g = torch.tanh(self.gate(c)) * 0.1         # 小尺度门控，初始≈0
+            g = torch.tanh(self.gate(c)) * 0.1
             z_tilde = z * (1 + g)
             z = z + self.alpha * (z_tilde - z)
             return self.post(z)
+
+        elif self.mode == "sigmoid":
+            g = torch.sigmoid(self.gate(torch.cat([z, c], dim=1)))  # [N, z_dim]
+            c_z = self.c_proj(c)                                    # [N, z_dim]
+            z_mix = g * z + (1.0 - g) * c_z
+            return self.post(z_mix)
+
+        elif self.mode == "concat_ln":
+            # 如果 c 来自冻结先验，这里可选：c = c.detach()
+            z = self.z_ln(z)
+            c = self.c_ln(c)
+            return self.post(torch.cat([z, c], dim=1))
+
         else:  # concat
             return self.post(torch.cat([z, c], dim=1))
 
@@ -407,18 +480,10 @@ class RLFields(nn.Module):
 
         # 门控fuser
         self.late_fusion = LateFusionHead(
-            z_dim=self.nt_feat_dim,
-            c_dim=self.env_output_feature,
+            z_dim=self.env_output_feature,
+            c_dim=self.nt_feat_dim,
             out_dim=self.nt_feat_dim,
             mode=self.fusion_mode
-        )
-
-        # fuser_mlp 用一个简单的 MLP 进一步处理融合后的特征
-        self.fused_mlp = nn.Sequential(
-            nn.LayerNorm(self.nt_feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.nt_feat_dim, self.nt_feat_dim),
-            nn.ReLU(inplace=True),
         )
     
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -464,10 +529,9 @@ class RLFields(nn.Module):
         nt_feat, _ = self.ntfields_nn.out_feature(self_obs)      # [B, nt_feat_dim]
 
         # -------- 6) LateFusionHead 门控融合 --------
-        fused_feat = self.late_fusion(nt_feat, env_embedding)    # [B, nt_feat_dim]
+        fused_feat = self.late_fusion(env_embedding, nt_feat)    # [B, nt_feat_dim]
 
         # -------- 7) RLFields featrure和gradient融合输出特征 --------
-        fused_feat = self.fused_mlp(fused_feat)                  # [B, nt_feat_dim] 
         gradient = self.ntfields_nn.calculate_gradient(self_obs) # [B, 4]
 
         return fused_feat, gradient

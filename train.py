@@ -3,6 +3,7 @@ import shutil
 from datetime import datetime
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
+from env.sim.marl_sim_env import RewardLogCallbacks
 from model.policy_value_network import RLFieldsActorModel
 from ray.rllib.models import ModelCatalog
 from ray.tune.logger import UnifiedLogger
@@ -38,28 +39,49 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
         )
         .framework("torch")
         .env_runners(
-            num_env_runners=1,
+            num_env_runners=cfg.experiment_params.num_env_runners,
+            num_envs_per_env_runner=cfg.experiment_params.num_envs_per_env_runner,
+            num_cpus_per_env_runner=cfg.experiment_params.num_cpus_per_env_runner,
+            num_gpus_per_env_runner=cfg.experiment_params.num_gpus_per_env_runner,
+            rollout_fragment_length=cfg.experiment_params.rollout_fragment_length,
             sample_timeout_s=None,
-            rollout_fragment_length = 200
         )
         .training(
             model={
                 "custom_model": "rlfields_actor",
                 "custom_model_config": cfg.get_network_config(),
             },
-            lr=3e-4,               
-            train_batch_size=16000,
-            use_gae=True,
-            lambda_=0.95,
-            use_critic=True,
-            use_kl_loss=True,
-            kl_coeff=0.5,
-            kl_target=0.01,
-            vf_loss_coeff=1.0,
-            entropy_coeff=0.0,
-            clip_param=0.2,
-            vf_clip_param=10.0,
-            grad_clip=0.5
+            # lr=3e-4,               
+            # train_batch_size=16000,
+            # use_gae=True,
+            # lambda_=0.95,
+            # use_critic=True,
+            # use_kl_loss=True,
+            # kl_coeff=0.5,
+            # kl_target=0.01,
+            # vf_loss_coeff=1.0,
+            # entropy_coeff=0.0,
+            # clip_param=0.2,
+            # vf_clip_param=10.0,
+            # grad_clip=0.5
+            lr=cfg.algorithm_params.lr,
+
+            train_batch_size=cfg.algorithm_params.train_batch_size,
+            use_gae=cfg.algorithm_params.use_gae,
+            lambda_=cfg.algorithm_params.lambda_,
+            use_critic=cfg.algorithm_params.use_critic,
+
+            use_kl_loss=cfg.algorithm_params.use_kl_loss,
+            kl_coeff=cfg.algorithm_params.kl_coeff,      
+            kl_target=cfg.algorithm_params.kl_target,    
+
+            entropy_coeff=cfg.algorithm_params.entropy_coeff,
+
+            vf_loss_coeff=cfg.algorithm_params.vf_loss_coeff,
+            vf_clip_param=cfg.algorithm_params.vf_clip_param,
+
+            clip_param=cfg.algorithm_params.clip_param,
+            grad_clip=cfg.algorithm_params.grad_clip,
         )
         .multi_agent(
             policies={"shared_policy"},
@@ -67,10 +89,7 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
         )
         .resources(
             num_gpus=1,
-            num_gpus_per_worker = 1,
-            num_gpus_per_learner_worker=1,
-            num_cpus_per_worker=1,
-            num_cpus_per_learner_worker=1
+            num_cpus_for_main_process=cfg.experiment_params.num_cpus_for_main_process
         )
     )
     return config
@@ -111,14 +130,15 @@ if __name__ == "__main__":
     cfg = SceneConfig()
     algo, exp_info = prepare_exp(cfg)
 
-    for it in range(20):
+    for it in range(60):
         result = algo.train()
-        print(f"[{exp_info['exp_name']}] "
-            f"iter={it} "
-            f"reward_mean={result['episode_reward_mean']:.2f} "
-            f"len_mean={result['episode_len_mean']:.1f} "
-            f"timesteps={result['timesteps_total']}")   
+        print(f"[{exp_info['exp_name']}] iter={it}", result)   
 
-        if it % cfg.experiment_params.ckpt_save_interval == 0:
-            algo.save(exp_info["ckpt_dir"])
-            print(f"Checkpoint saved at {exp_info['ckpt_dir']}")
+        iter_ckpt_root = os.path.join(exp_info["ckpt_dir"], f"iter_{it + 1:06d}")
+        algo.save(iter_ckpt_root)
+        print(f"Checkpoint saved at {iter_ckpt_root}")
+
+    # save final
+    final_root = os.path.join(exp_info["ckpt_dir"], "final")
+    final_ckpt = algo.save(final_root)
+    print(f"Final checkpoint saved at {final_ckpt}")

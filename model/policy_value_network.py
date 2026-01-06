@@ -60,7 +60,7 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
             nt_basic_block=cfg.get("nt_basic_block", "resnet"),
             nt_use_unet=cfg.get("nt_use_unet", False),
             nt_symm_op_type=cfg.get("nt_symm_op_type", "min_max"),
-            nt_pretrained_path = cfg.get("nt_pretrained_path", 'ckpt.pt'),
+            nt_pretrained_path=cfg.get("nt_pretrained_path", 'ckpt.pt'),
             device=cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
         )
 
@@ -68,21 +68,38 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         self.fused_feat_dim = self.rlfields.nt_feat_dim
         self.nt_dim = self.rlfields.nt_dim  # 一般是 2，对应 start 的维度
 
-        # ==== 策略部分 ====
-        # 1) 从 fused_feat 学一个小的残差 Δμ(fused_feat)
+        # ==== 先验 embedding 分支 ====
+        # 输入: [g_dir(2), g_norm(1)] 共 nt_dim + 1 维
+        self.prior_embed_dim = 64
+        self.prior_mlp = nn.Sequential(
+            nn.Linear(self.nt_dim + 1, self.prior_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.prior_embed_dim, self.prior_embed_dim),
+            nn.SiLU(),
+        )
+
+        # ==== 残差头：输入 = fused_feat + prior_feat ====
+        delta_input_dim = self.fused_feat_dim + self.prior_embed_dim
+
+        # 从 [fused_feat, prior_feat] 学习对于prior的调控
         self.delta_head = nn.Sequential(
-            nn.Linear(self.fused_feat_dim, 128),
-            nn.ReLU(), 
+            nn.Linear(delta_input_dim, 128),
+            nn.ReLU(),
             nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, self.action_dim),
         )
 
-        # 2) 先验方向的缩放系数（初始为 1）
-        self.prior_scale = nn.Parameter(torch.tensor(1.0))
+        # 残差头的最后一层初始化得很“小”，避免一开始把先验打乱
+        last_linear = self.delta_head[-1]
+        with torch.no_grad():
+            last_linear.weight.mul_(0.6)
+            last_linear.bias[0] = 0.5
 
-        # 3) log_std：做成全局可学参数
+        # log_std：全局可学参数，一开始噪声不要太大
         self.log_std_param = nn.Parameter(torch.zeros(self.action_dim))
+        with torch.no_grad():
+            self.log_std_param.data.fill_(-1.0)
 
         # ==== 价值函数部分 ====
         self.value_head = nn.Sequential(
@@ -104,25 +121,53 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         """
         obs = input_dict["obs"].float()
 
-        # RLFields: fused_feat + 全梯度
-        fused_feat, grad_all = self.rlfields(obs)   # fused_feat: [B, T], grad_all: [B,4]
+        # RLFields: 得到融合特征 + NTFields 梯度
+        fused_feat, grad_all = self.rlfields(obs)      # fused_feat: [B, T], grad_all: [B, 2*nt_dim]
         self._last_fused_feat = fused_feat
 
-        # 只用对 start 的梯度作为先验方向（前 nt_dim 维）
-        grad_start = grad_all[:, :self.nt_dim]                   # [B, 2]
-        prior_dir = self.prior_scale * grad_start                # 可学缩放
+        # 只用对 start 的梯度作为先验
+        grad_start = grad_all[:, :self.nt_dim]         # [B, 2]
 
-        # 从 fused_feat 学残差 Δμ
-        delta_mu = self.delta_head(fused_feat)                   # [B, 2]
+        # 模长 + 方向
+        g_norm = torch.norm(grad_start, dim=-1, keepdim=True)        # [B, 1]
+        g_dir  = grad_start / (g_norm + 1e-8)                        # [B, 2]
+        
+        # 正交方向 (2D)
+        g_perp = torch.cat([-g_dir[:, 1:2], g_dir[:, 0:1]], dim=-1)  # [B, 2]
 
-        # 最终均值：prior + residual
-        mu = prior_dir + delta_mu                                # [B, 2]                  
+        # ===== 先验 embedding =====
+        prior_raw  = torch.cat([g_dir, g_norm], dim=-1)  # [B, nt_dim + 1] = [B, 3]
+        prior_feat = self.prior_mlp(prior_raw)           # [B, prior_embed_dim]
 
-        # log_std：全局参数 broadcast
-        log_std = self.log_std_param.expand_as(mu)               # [B, 2]
+        # ===== 残差头输入：环境特征 + 先验 embedding =====
+        delta_in = torch.cat([fused_feat, prior_feat], dim=-1)  # [B, T + prior_embed_dim]
 
-        # RLlib Gaussian 的 logits = [mean, log_std]
-        logits = torch.cat([mu, log_std], dim=-1)                # [B, 4]
+        coeff = self.delta_head(delta_in)     # [B,2]
+        raw_par  = coeff[:, :1]
+        raw_perp = coeff[:, 1:2]
+
+        # 允许后退：[-1,1]
+        s_par  = raw_par  # torch.tanh(raw_par)          # [-1,1]
+        s_perp = raw_perp # torch.tanh(raw_perp)         # [-1,1]         
+            
+        # 平行方向：仍然保留“先验强度/尺度”作为基准
+        g_mag = torch.clamp(g_norm, 0.0, 1.0)
+        a_par = s_par * g_mag               
+
+        # 垂直方向：不跟 g_norm 绑定
+        perp_scale = 1.2                      # 需要更强侧向避让就调大，比如 1.2~1.5
+        a_perp = s_perp * perp_scale
+
+        mu = a_par * g_dir + a_perp * g_perp
+        # mu_norm = torch.norm(mu, dim=-1, keepdim=True).clamp(min=1e-8)
+        # scale = torch.tanh(mu_norm) / mu_norm
+        # mu = mu * scale
+        mu_norm = torch.norm(mu, dim=-1, keepdim=True).clamp(min=1e-8)
+        vmax = 1.5
+        mu = mu * (vmax * torch.tanh(mu_norm / vmax) / mu_norm)
+
+        log_std = self.log_std_param.expand_as(mu)
+        logits = torch.cat([mu, log_std], dim=-1)    # [B, 2*action_dim]
 
         return logits, state
 

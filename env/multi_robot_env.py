@@ -40,8 +40,8 @@ class MultiRobotEnv(MultiAgentEnv):
     
     def get_action_space(self, agent_id):
         if agent_id.startswith("robot_"):
-            return Box(low=-np.inf,
-                       high=np.inf,
+            return Box(low=-1.5,
+                       high=1.5,
                        shape=(self.action_dim,),
                        dtype=np.float32
                     )
