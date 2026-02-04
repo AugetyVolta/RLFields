@@ -49,21 +49,28 @@ class RobotParameters:
     lidar_angle_range: float = 6.28
     lidar_number: int = 200
 
-    single_max_timestep: int = 1000   # 每个机器人单次任务的最大时间步数
-    move_single_step: float = 0.1  # 每个时间步机器人的最大移动距离
+    single_max_timestep: int = 500   # 每个机器人单次任务的最大时间步数, 最大500步
+    move_single_step: float = 0.1    # 单位速度1,单位时间，每个时间步机器人的最大移动距离, 和dt保持一致，1*dt
+    v_max: float = 1.5               # 机器人的最大速度
 
 @dataclass
 class RLFieldsConfig:
     self_obs_dim: int = 4
-    self_obs_embed_dim: int = 128
+    self_obs_embed_dim: int = 64
     neighbor_obs_dim: int = 4
     neighbor_hidden_size: int = 128
-    neighbor_base_channels: int = 32
+    neighbor_base_channels: int = 64
     obstacle_embedding_dim: int = 128
-    n_head: int = 3
+    n_head: int = 4
     num_use_neighbor_obs: int = 3    # 使用固定范围的最近几个机器人作为邻居观察
-    env_output_feature: int = 128
-    fusion_mode: str = "concat"
+    env_output_feature: int = 256
+    fusion_mode: str = "concat_ln"
+    # -------- SDF/Attention 增强 --------
+    use_sdf_grad: bool = True
+    sdf_grad_scale: float = 1.0
+    sdf_grad_clip: float | None = 1.0
+    use_ctx_ffn: bool = True
+    use_neigh_self_attn: bool = True
     # -------- NTFields 配置 --------
     nt_dim: int = 2
     nt_vmax: float = 1.0
@@ -79,7 +86,50 @@ class RLFieldsConfig:
 
 @dataclass
 class RewardConfig:
-    pass
+    # -------- 时间/进度 --------
+    w_T_progress: float = 10.0
+    w_step: float = 0.025
+    delta_T_clip: float = 1.0
+
+    # -------- 多机器人势场 --------
+    w_peer_delta: float = 2.0
+    w_peer_static: float = 0.15
+    w_peer_away_factor: float = 0.8
+
+    # -------- 障碍物清距 --------
+    w_obst_delta: float = 1.5
+    w_obst_static: float = 0.08
+    w_obst_away_factor: float = 0.3
+    clear_danger: float = 0.10
+    clear_safe: float = 0.45
+
+    # -------- 速度项 --------
+    w_speed_safe: float = 0.06
+    w_speed_danger: float = 0.20
+
+    # -------- 先验方向对齐 --------
+    w_prior_align: float = 0.03
+    align_speed_power: float = 2.0
+
+    # -------- 终止项 --------
+    bonus_arrive: float = 25.0
+    pen_timeout: float = 30.0
+    pen_collision_robot: float = 30.0
+    pen_collision_obstacle: float = 30.0
+    collision_peer_margin: float = 0.05
+
+    # -------- 势场形状/阈值 --------
+    peer_danger_offset: float = 0.3
+    peer_safe_margin: float = 0.5
+    peer_sense_margin: float = 1.0
+    peer_k_far: float = 0.3
+    peer_k_mid: float = 1.0
+    peer_k_max: float = 3.0
+    peer_potential_beta: float = 5.0
+
+    # -------- 风险 gate --------
+    progress_gate_risk_coeff: float = 0.8
+    progress_gate_min: float = 0.2
 
 @dataclass
 class ExprimentConfig:
@@ -89,17 +139,20 @@ class ExprimentConfig:
     ckpt_save_interval: int = 10
     restore_ckpt_path: str = None
 
-    num_env_runners: int = 1
+    num_env_runners: int = 2
     num_envs_per_env_runner: int = 1
     num_cpus_per_env_runner: int = 10
     num_gpus_per_env_runner: int = 0.5
-    rollout_fragment_length: int = 200
-    num_cpus_for_main_process: int = 8
+    rollout_fragment_length: int = 150
+    num_cpus_for_main_process: int = 4
 
 @dataclass
 class AlgorithmConfig:
-    lr: float = 1e-4
-    train_batch_size: int = 400
+    lr: float = 5e-5
+    gamma: float = 0.99
+    num_epochs: int = 15
+    train_batch_size: int = 16000
+    minibatch_size: int = 512
     use_gae: bool = True
     lambda_: float = 0.95
     use_critic: bool = True
@@ -110,7 +163,7 @@ class AlgorithmConfig:
     vf_loss_coeff: float = 1.0
     vf_clip_param: float = 10.0
     clip_param: float = 0.2
-    grad_clip: float = 1.0
+    grad_clip: float = None
 
 @dataclass
 class SceneConfig:
@@ -148,6 +201,11 @@ class SceneConfig:
             "num_use_neighbor_obs": self.network_params.num_use_neighbor_obs,
             "env_output_feature": self.network_params.env_output_feature,
             "fusion_mode": self.network_params.fusion_mode,
+            "use_sdf_grad": self.network_params.use_sdf_grad,
+            "sdf_grad_scale": self.network_params.sdf_grad_scale,
+            "sdf_grad_clip": self.network_params.sdf_grad_clip,
+            "use_ctx_ffn": self.network_params.use_ctx_ffn,
+            "use_neigh_self_attn": self.network_params.use_neigh_self_attn,
             "nt_dim": self.network_params.nt_dim,
             "nt_vmax": self.network_params.nt_vmax,
             "nt_h_size": self.network_params.nt_h_size,

@@ -47,15 +47,16 @@ class MARL_SIM(SIM_ENV):
 
         self.single_max_timestep = scene_cfg.robot_params.single_max_timestep 
         self.move_single_step = scene_cfg.robot_params.move_single_step  
-        self.v_max = scene_cfg.network_params.nt_vmax 
-        
+        self.v_max = scene_cfg.robot_params.v_max
+
+        # reward 配置
+        self.reward_cfg = scene_cfg.reward_params
         self.robot_times = torch.zeros(self.num_robots, dtype=torch.int32)  # time step counter
         self.robot_terminateds = torch.zeros(self.num_robots, dtype=torch.bool) # terminate
         self.robot_truncateds = torch.zeros(self.num_robots, dtype=torch.bool) # truncate
 
         self.robot_last_goal_dist = torch.zeros(self.num_robots, dtype=torch.float32)
         self.robot_radius = scene_cfg.robot_params.radius
-        self.robot_last_action = np.zeros((self.num_robots, 2), dtype=np.float32)
 
         self.device = scene_cfg.network_params.device
         self.ntfields_nn = NN(device=scene_cfg.network_params.device,
@@ -74,27 +75,50 @@ class MARL_SIM(SIM_ENV):
         self.ntfields_nn.load_state_dict(ckpt["model_state_dict"], strict=True)
 
         self.robot_last_T = torch.zeros(self.num_robots, dtype=torch.float32)
+        self.robot_last_prior_dir = np.zeros((self.num_robots, 2), dtype=np.float32)
         self.robot_last_peer_phi = torch.zeros(self.num_robots, dtype=torch.float32)
         self.robot_last_obst_loss = torch.zeros(self.num_robots, dtype=torch.float32)
 
         self._env_step_id = 0
     # only alive robots have action
-    def step(self, action_dict): # action_dict: dict of(robot_id, [d_x, d_y]), [-1, 1]
+    def step(self, action_dict): # action_dict: dict of(robot_id, [alpha, theta]), [-1, 1]
         applied_actions = []
         action_ids = []
-        raw_actions = {}  # 新增：记录归一化动作，用于平滑/速度惩罚
+        raw_actions = {}   # 归一化动作 (alpha/theta)
+        exec_dirs = {}     # 实际执行方向（单位向量）
+        exec_speeds = {}   # 实际执行速度（m/s）
+        # -------- 1) 用“上一次 obs 的 prior_dir”把 (alpha, theta) -> (dx, dy) 并执行 --------
         for robot_id, action in action_dict.items():
             id = int(robot_id.split('_')[-1]) # 'robot_0' -> 0
             action_ids.append(id)
-            # 记录原始归一化动作
+            
+            alpha_raw = float(action[0])
+            theta_raw = float(action[1])
             raw_actions[id] = np.array(action, dtype=np.float32)
-            d_x, d_y = action
-            print(robot_id, action)
-            d_x *= self.move_single_step / self.v_max
-            d_y *= self.move_single_step / self.v_max
-            # d_x *= self.world_w * self.move_single_step / self.v_max
-            # d_y *= self.world_h * self.move_single_step / self.v_max
-            applied_actions.append([d_x, d_y])
+
+            # alpha: [-1,1] -> [0,1]
+            alpha01 = (alpha_raw + 1.0) / 2.0
+            alpha01 = float(np.clip(alpha01, 0.0, 1.0))
+
+            # theta: [-1,1] -> [-pi, pi]
+            theta = float(theta_raw) * math.pi
+
+            # prior_dir 已经是单位向量了
+            prior_prev = self.robot_last_prior_dir[id].astype(np.float32)
+
+            # 旋转 prior
+            c, s = math.cos(theta), math.sin(theta)
+            dir_x = c * float(prior_prev[0]) - s * float(prior_prev[1])
+            dir_y = s * float(prior_prev[0]) + c * float(prior_prev[1])
+            exec_dir = np.array([dir_x, dir_y], dtype=np.float32)
+
+            v = alpha01 * float(self.v_max)  # 类似于m/s
+            dx = float(exec_dir[0]) * v * float(self.move_single_step)
+            dy = float(exec_dir[1]) * v * float(self.move_single_step)
+
+            applied_actions.append([dx, dy])
+            exec_dirs[id] = exec_dir
+            exec_speeds[id] = v
 
         self.env.step(action=applied_actions, action_id=action_ids)
         if self.render:
@@ -106,7 +130,7 @@ class MARL_SIM(SIM_ENV):
         terminateds = {}
         truncateds = {}
         infos = {}
-
+        # -------- 2) 先算 reward（内部算一次 T/prior 并缓存），再拼 obs --------
         for id in action_ids:
             robot_id = f'robot_{id}'
             
@@ -123,22 +147,22 @@ class MARL_SIM(SIM_ENV):
                     is_truncated = True
                     truncateds[robot_id] = self.robot_truncateds[id].item()
             
-            # 准备观测和info
-            obs[robot_id] = self._prepare_obs(id)
-            infos[robot_id] = {}
-
-            # 计算 reward + info
             r, info = self._calculate_reward(
-                id,
-                raw_actions[id],
-                obs[robot_id],
-                is_collision,
-                is_arrive,
-                is_truncated,
+                id=id,
+                action_raw=raw_actions[id],
+                prior_dir_prev=self.robot_last_prior_dir[id].copy(),  # copy 防止未来改动引入引用问题
+                exec_dir=exec_dirs[id],
+                exec_speed=exec_speeds[id],
+                is_collision=is_collision,
+                is_arrive=is_arrive,
+                is_truncated=is_truncated,
             )
             rewards[robot_id] = r
-            infos[robot_id].update(info)
+            infos[robot_id] = info
             infos[robot_id]["_env_step_id"] = self._env_step_id
+            
+            # reward 已经更新了 prior_dir_curr 缓存，这里直接用缓存拼 obs
+            obs[robot_id] = self._prepare_obs(id)
         
         # 处理所有机器人终止的情况
         robot_done = self.robot_terminateds | self.robot_truncateds
@@ -168,11 +192,13 @@ class MARL_SIM(SIM_ENV):
         obs = [ self_obs(self.neighbor_obs_dim),
                 neighbor_obs(num_use_neighbor_obs * self.neighbor_obs_dim),
                 neighbor_valid_num(1),
-                sdf_flat(map_size*map_size) ]
+                sdf_flat(map_size*map_size),
+                prior_dir(nt_dim) ]
         其中:
           - self_obs = [x, y, goal_x, goal_y]（绝对坐标）
           - neighbor_obs 每个邻居 = [dx, dy, dgoal_x, dgoal_y]
             都是相对于当前机器人 (x,y) 的相对坐标
+          - prior_dir 为 env 预先计算好的单位方向（与 policy 的 theta 旋转基准一致）
         """
         robot = self.robot_list[id]
         # ===== 1) self_obs: [x, y, goal_x, goal_y] (绝对坐标) =====
@@ -225,13 +251,17 @@ class MARL_SIM(SIM_ENV):
         sdf_grid = np.clip(sdf_grid, 0.0, self.r_max) / self.r_max # sdf归一化到 [0, 1]
         sdf_flat = sdf_grid.flatten()  # (map_size*map_size,)
 
-        # ===== 4) 拼接总观测 =====
+        # ===== 4) prior action (direction) =====
+        prior_dir = self.robot_last_prior_dir[id].astype(np.float32)  # (nt_dim,)
+
+        # ===== 5) 拼接总观测 =====
         obs = np.concatenate(
             [
                 self_obs,                       # self_obs_dim
                 neighbor_obs_flat,              # K * neighbor_obs_dim
                 np.array([neighbor_valid_num], dtype=np.float32),  # 1
                 sdf_flat,                       # map_size*map_size
+                prior_dir,                      # nt_dim
             ],
             axis=0,
         )
@@ -427,7 +457,7 @@ class MARL_SIM(SIM_ENV):
                 min_dist = dist
         return min_dist
     
-    def _compute_travel_time_and_prior_dir(self, pos: np.ndarray, goal: np.ndarray) -> float:
+    def _compute_travel_time_and_prior_dir(self, pos: np.ndarray, goal: np.ndarray):
         """
         用 PC-Planner 估计从 pos 到 goal 的“时间” T(x, goal), 以及先验方向。
         - 若 self.ntfields_nn 为 None, 则退化为欧氏距离近似。
@@ -441,7 +471,7 @@ class MARL_SIM(SIM_ENV):
                 prior_dir = np.zeros_like(diff)
             else:
                 prior_dir = diff / d
-            return d, torch.from_numpy(prior_dir).unsqueeze(0).to(self.device)
+            return d, prior_dir
 
         pos_norm  = (pos  - self.world_center) / self.world_scale
         goal_norm = (goal - self.world_center) / self.world_scale
@@ -460,10 +490,18 @@ class MARL_SIM(SIM_ENV):
         # 用 NTFields 的梯度给一个先验方向（对 start 的梯度）
         grad_all = self.ntfields_nn.calculate_gradient(coords)  # [1,4] = [dT/dx_start(2), dT/dx_goal(2)]
         grad_start = grad_all[:, :2]                            # [1,2]
-        grad_norm = torch.norm(grad_start, dim=-1, keepdim=True)
-        prior_dir = grad_start / (grad_norm + 1e-8)             # [1,2]
+        gn = torch.norm(grad_start, dim=-1, keepdim=True)
 
-        return float(TT.item()), prior_dir
+        # fallback：梯度太小就用“指向 goal”的方向
+        if float(gn.item()) < 1e-8:
+            diff = (goal_norm - pos_norm).astype(np.float32)
+            n = float(np.linalg.norm(diff))
+            prior = (diff / (n + 1e-8)).astype(np.float32)
+        else:
+            prior_t = grad_start / (gn + 1e-8)  # [1,2]
+            prior = prior_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        
+        return float(TT.item()), prior
     
     def _single_neighbor_potential(self, d: float) -> float:
         """
@@ -479,16 +517,17 @@ class MARL_SIM(SIM_ENV):
         通过线性 / 二次插值保证在 d_danger、d_safe、d_sense 处函数值连续。
         """
         r = float(self.robot_radius)
+        cfg = self.reward_cfg
 
         # 三个半径门槛
-        d_danger = 2.0 * r + 0.3   # 危险壳
-        d_safe   = d_danger + 0.5  # 安全壳外缘
-        d_sense  = d_safe   + 1.0  # 感知上限
+        d_danger = 2.0 * r + cfg.peer_danger_offset
+        d_safe   = d_danger + cfg.peer_safe_margin
+        d_sense  = d_safe   + cfg.peer_sense_margin
 
-        # 三段对应的大致势场强度 (可调)
-        k_far  = 0.3   # 远区
-        k_mid  = 1.0   # 安全壳
-        k_max  = 3.0   # 危险区极大值
+        # 三段对应的大致势场强度
+        k_far  = cfg.peer_k_far
+        k_mid  = cfg.peer_k_mid
+        k_max  = cfg.peer_k_max
 
         d = float(d)
 
@@ -525,9 +564,10 @@ class MARL_SIM(SIM_ENV):
         """
         robot_pos = self.robot_list[id].state[:2].ravel()
         r = float(self.robot_radius)
+        cfg = self.reward_cfg
 
-        d_danger = 2.0 * r + 0.3
-        d_safe   = d_danger + 0.5
+        d_danger = 2.0 * r + cfg.peer_danger_offset
+        d_safe   = d_danger + cfg.peer_safe_margin
 
         phi_list = []
         min_dist = float("inf")
@@ -556,7 +596,7 @@ class MARL_SIM(SIM_ENV):
         arr = np.asarray(phi_list, dtype=np.float32)
 
         # smooth max: Phi ≈ max φ_j
-        beta = 5.0
+        beta = cfg.peer_potential_beta
         m = float(arr.max())
         Phi = m + (1.0 / beta) * float(np.log(np.mean(np.exp(beta * (arr - m)))))
 
@@ -565,183 +605,192 @@ class MARL_SIM(SIM_ENV):
     def _calculate_reward(
         self,
         id: int,
-        action,
-        obs: np.ndarray,
+        action_raw,
+        prior_dir_prev: np.ndarray,
+        exec_dir: np.ndarray,
+        exec_speed: float,
         is_collision: bool,
         is_arrive: bool,
         is_truncated: bool,
     ):
         robot = self.robot_list[id]
+        cfg = self.reward_cfg
 
-        # ---------------- 权重 ----------------
-        w_T_progress   = 6.0    # Time Field 进度
-        w_step         = 0.03   # 每步时间成本
+        # ---------------- 权重（核心：让 shaping 变成正的） ----------------
+        w_T_progress   = cfg.w_T_progress
+        w_step         = cfg.w_step
 
-        # 势场相关：变化项 + 静态项
-        w_peer_delta   = 3.0    # 势场变化惩罚 (ΔΦ)
-        w_peer_static  = 0.25    # 高势场静态惩罚 Φ（只在危险区内）
+        w_peer_delta   = cfg.w_peer_delta
+        w_peer_static  = cfg.w_peer_static
 
-        w_obst_delta  = 1.5     # 惩罚“更靠近”
-        w_obst_static = 0.05    # 贴墙静态惩罚
+        w_obst_delta   = cfg.w_obst_delta
+        w_obst_static  = cfg.w_obst_static
 
-        w_speed_base   = 0.005  # 速度惩罚
-        w_speed_danger = 0.08   # 危险区域的速度惩罚加成
+        w_speed_safe   = cfg.w_speed_safe
+        w_speed_danger = cfg.w_speed_danger
 
-        w_prior_align  = 0.02   # 先验方向对齐
+        w_prior_align  = cfg.w_prior_align
 
-        bonus_arrive          = 25.0
-        pen_timeout           = 30.0
-        pen_collision_robot   = 35.0
-        pen_collision_obstacle= 25.0
+        bonus_arrive           = cfg.bonus_arrive
+        pen_timeout            = cfg.pen_timeout
+        pen_collision_robot    = cfg.pen_collision_robot
+        pen_collision_obstacle = cfg.pen_collision_obstacle
 
         r = float(self.robot_radius)
-
-        # 三个半径门槛
-        d_danger = 2.0 * r + 0.3   # 危险壳
-        d_safe   = d_danger + 0.5  # 安全壳外缘
-        d_sense  = d_safe   + 1.0  # 感知上限
 
         # ---------------- 当前几何量 ----------------
         robot_pos  = robot.state[:2].ravel()
         robot_goal = robot.goal[:2].ravel()
 
-        cur_action = np.asarray(action, dtype=np.float32)
-        speed = float(np.linalg.norm(cur_action))
+        speed   = float(exec_speed)
+        cur_dir = exec_dir.astype(np.float32).reshape(-1)
 
-        # 1) NTFields 时间进度 ΔT + 先验方向
-        T_curr, prior_dir = self._compute_travel_time_and_prior_dir(robot_pos, robot_goal)
+        # ===================== 1) NTFields 时间进度 + 当前先验方向 =====================
+        T_curr, prior_dir_curr = self._compute_travel_time_and_prior_dir(robot_pos, robot_goal)
         T_prev = float(self.robot_last_T[id].item())
-        delta_T = float(np.clip(T_prev - T_curr, -1.0, 1.0))
+        delta_T = float(np.clip(T_prev - T_curr, -cfg.delta_T_clip, cfg.delta_T_clip))
 
-        # 2) 多机器人势场 Φ 及其变化 ΔΦ
+        # ===================== 2) 多机器人势场 Φ 与 ΔΦ =====================
         Phi_curr, min_peer_dist, in_peer_danger = self._compute_peer_potential(id)
         Phi_prev = float(self.robot_last_peer_phi[id].item())
-        delta_Phi = Phi_curr - Phi_prev      # >0 表示变更危险
+        delta_Phi = float(Phi_curr - Phi_prev)
 
-        # 3) 障碍物接近程度
-        scan = robot.lidar.get_scan()
-        ranges = np.asarray(scan["ranges"], dtype=np.float32)
-        valid = np.isfinite(ranges)
-        if valid.any():
-            min_lidar = float(np.clip(ranges[valid].min(), 0.0, self.r_max))
+        # ===================== 3) 障碍物/墙清距（不用 lidar） =====================
+        min_clear, clear_obs, clear_wall = self._min_surface_clearance_static(id)
+
+        clear_danger = cfg.clear_danger
+        clear_safe   = cfg.clear_safe
+
+        if min_clear <= clear_danger:
+            obst_risk = 1.0
+        elif min_clear >= clear_safe:
+            obst_risk = 0.0
         else:
-            min_lidar = self.r_max
+            obst_risk = float((clear_safe - min_clear) / max(clear_safe - clear_danger, 1e-6))
+            obst_risk = float(np.clip(obst_risk, 0.0, 1.0))
 
-        clear_safe = 2.0 * self.robot_radius + 0.2
-        in_obst_danger = (min_lidar < clear_safe)
+        in_obst_danger = (obst_risk > 1e-6)
 
-        if in_obst_danger:
-            loss_clear = (clear_safe - min_lidar) / clear_safe
-            loss_clear = float(np.clip(loss_clear, 0.0, 1.0))
-        else:
-            loss_clear = 0.0
-        
+        loss_clear = float(obst_risk)
         loss_prev  = float(self.robot_last_obst_loss[id].item())
-        delta_loss = loss_clear - loss_prev  # >0 更靠近障碍
+        delta_loss = float(loss_clear - loss_prev)
         self.robot_last_obst_loss[id] = float(loss_clear)
-        # ---------------- 各项 reward 组合 ----------------
+
+        # ===================== 4) 风险 gate =====================
+        d_danger = 2.0 * r + cfg.peer_danger_offset
+        d_safe   = d_danger + cfg.peer_safe_margin
+
+        if min_peer_dist <= d_danger:
+            peer_risk = 1.0
+        elif min_peer_dist >= d_safe:
+            peer_risk = 0.0
+        else:
+            peer_risk = float((d_safe - min_peer_dist) / max(d_safe - d_danger, 1e-6))
+            peer_risk = float(np.clip(peer_risk, 0.0, 1.0))
+
+        risk = max(peer_risk, obst_risk)
+        # 关键：不要让 progress_gate 直接变 0（避免“原地等死”）
+        progress_gate = float(np.clip(1.0 - cfg.progress_gate_risk_coeff * risk, cfg.progress_gate_min, 1.0))
+        danger_gate   = float(risk)
+
+        # ===================== 5) reward 组合 =====================
         reward = 0.0
 
-        # 安全区内的 T 进度奖励, 但是避免一开始避让就回头
-        # 0~1，越近越小
-        peer_risk = float(np.clip((d_safe - min_peer_dist)/(d_safe - d_danger), 0.0, 1.0))
-        obst_risk = loss_clear
-        risk = max(peer_risk, obst_risk)
-        progress_gate = 1 - risk
+        # (a) 时间进度
         r_T_progress = w_T_progress * progress_gate * delta_T
-
         reward += r_T_progress
 
-        # 每步时间成本
+        # (b) 每步时间成本
         r_step = -w_step
         reward += r_step
 
-        # 势场变化惩罚：ΔΦ>0 → 靠近别人 → 惩罚
-        w_peer_away = 0.4 * w_peer_delta  # 小于惩罚权重
-        r_peer_delta = -w_peer_delta * max(delta_Phi, 0.0) + w_peer_away * max(-delta_Phi, 0.0)
-        # 高势场静态惩罚：只有在“避让区”才启用，否则远处偶尔靠近一下惩罚交给 ΔΦ
+        # (c) 多机器人势场：ΔΦ + 静态 Φ（只在避让区）
+        w_peer_away = cfg.w_peer_away_factor * w_peer_delta  # ★ 增强“远离别人”的收益，避免停滞
+        r_peer_delta  = -w_peer_delta * max(delta_Phi, 0.0) + w_peer_away * max(-delta_Phi, 0.0)
         r_peer_static = -w_peer_static * Phi_curr if in_peer_danger else 0.0
-
         reward += r_peer_delta + r_peer_static
 
-        # 障碍物清距惩罚
+        # (d) 障碍物清距：Δloss + 静态 loss（只在有风险时）
         if in_obst_danger:
-            w_obst_away = 0.3 * w_obst_delta
-            r_obst_delta = -w_obst_delta * max(delta_loss, 0.0) + w_obst_away * max(-delta_loss, 0.0)
+            w_obst_away = cfg.w_obst_away_factor * w_obst_delta
+            r_obst_delta  = -w_obst_delta * max(delta_loss, 0.0) + w_obst_away * max(-delta_loss, 0.0)
             r_obst_static = -w_obst_static * loss_clear
         else:
             r_obst_delta  = 0.0
             r_obst_static = 0.0
-        
         reward += r_obst_delta + r_obst_static
 
-        # 速度惩罚
-        # 风险度：0~1
-        r_speed = -(w_speed_base + w_speed_danger * peer_risk) * (speed ** 2)
+        # (e) 速度项：安全区鼓励快，危险区惩罚快
+        v_max = max(float(self.v_max), 1e-6)
+        speed_norm = float(np.clip(speed / v_max, 0.0, 1.0))
+        r_speed = (w_speed_safe * (1.0 - danger_gate) * speed_norm) - (w_speed_danger * danger_gate * (speed_norm ** 2))
         reward += r_speed
 
-        # 安全区内的先验方向对齐奖励
+        # (f) 先验方向对齐（安全区更强）
         r_prior_align = 0.0
-        speed_gate = min(speed, 1.0) # 让进度奖励只在有速度时生效
-        align_gate = progress_gate * speed_gate
-        if speed > 1e-4:
-            cur_dir = cur_action / (speed + 1e-8)
-            prior_np = prior_dir.detach().cpu().numpy().reshape(-1)
-            pn = float(np.linalg.norm(prior_np))
-            if pn > 1e-6:
-                prior_unit = prior_np / pn
-                cos_theta = float(np.dot(cur_dir, prior_unit))
-                cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
-                r_prior_align = w_prior_align * cos_theta
-                reward += r_prior_align * align_gate
+        align_gate = progress_gate * (speed_norm ** cfg.align_speed_power)
+        pn = float(np.linalg.norm(prior_dir_prev))
+        if pn > 1e-6 and speed > 1e-4:
+            prior_unit = (prior_dir_prev / pn).astype(np.float32).reshape(-1)
+            cos_theta = float(np.dot(cur_dir, prior_unit))
+            cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+            r_prior_align = w_prior_align * cos_theta
+            reward += r_prior_align * align_gate
 
-        # 终止项
-        r_arrive   = bonus_arrive if is_arrive    else 0.0
-        r_timeout  = -pen_timeout if is_truncated else 0.0
+        # (g) 终止项
+        r_arrive  = bonus_arrive if is_arrive else 0.0
+        r_timeout = -pen_timeout if is_truncated else 0.0
 
         if is_collision:
-            if min_peer_dist < 2.0 * self.robot_radius + 0.05:
-                r_coll_robot   = -pen_collision_robot
-                r_coll_obst    = 0.0
+            if min_peer_dist < 2.0 * self.robot_radius + cfg.collision_peer_margin:
+                r_coll_robot = -pen_collision_robot
+                r_coll_obst  = 0.0
             else:
-                r_coll_robot   = 0.0
-                r_coll_obst    = -pen_collision_obstacle
+                r_coll_robot = 0.0
+                r_coll_obst  = -pen_collision_obstacle
         else:
             r_coll_robot = 0.0
             r_coll_obst  = 0.0
 
         reward += r_arrive + r_timeout + r_coll_robot + r_coll_obst
 
-        # 更新缓存
-        self.robot_last_T[id]        = float(T_curr)
-        self.robot_last_peer_phi[id] = float(Phi_curr)
-        self.robot_last_action[id]   = cur_action
+        # ===================== 6) 更新缓存 =====================
+        self.robot_last_T[id]         = float(T_curr)
+        self.robot_last_peer_phi[id]  = float(Phi_curr)
+        self.robot_last_prior_dir[id] = prior_dir_curr.astype(np.float32)
 
-        # 如果你已经在 step 里把 info 接出来，可以继续返回 info；否则只返回 reward。
         info = {
-            "r_total":        float(reward),
-            "r_T_progress":   float(r_T_progress),
-            "r_step":         float(r_step),
-            "r_peer_delta":   float(r_peer_delta),
-            "r_peer_static":  float(r_peer_static),
-            "r_obst_delta":   float(r_obst_delta),
-            "r_obst_static":  float(r_obst_static),
-            "r_speed":        float(r_speed),
-            "r_prior_align_raw":  float(r_prior_align),
-            "r_prior_align":  float(r_prior_align * align_gate),
-            "r_arrive":       float(r_arrive),
-            "r_timeout":      float(r_timeout),
-            "r_coll_robot":   float(r_coll_robot),
-            "r_coll_obst":    float(r_coll_obst),
+            "r_total":         float(reward),
+            "r_T_progress":    float(r_T_progress),
+            "r_step":          float(r_step),
+            "r_peer_delta":    float(r_peer_delta),
+            "r_peer_static":   float(r_peer_static),
+            "r_obst_delta":    float(r_obst_delta),
+            "r_obst_static":   float(r_obst_static),
+            "r_speed":         float(r_speed),
+            "r_prior_align_raw": float(r_prior_align),
+            "r_prior_align":   float(r_prior_align * align_gate),
+            "r_arrive":        float(r_arrive),
+            "r_timeout":       float(r_timeout),
+            "r_coll_robot":    float(r_coll_robot),
+            "r_coll_obst":     float(r_coll_obst),
 
-            "T_curr":         float(T_curr),
-            "delta_T":        float(delta_T),
-            "Phi_curr":       float(Phi_curr),
-            "delta_Phi":      float(delta_Phi),
-            "min_peer_dist":  float(min_peer_dist),
-            "min_lidar":      float(min_lidar),
-            "in_peer_danger": bool(in_peer_danger),
-            "in_obst_danger": bool(in_obst_danger),
+            "T_curr":          float(T_curr),
+            "delta_T":         float(delta_T),
+            "Phi_curr":        float(Phi_curr),
+            "delta_Phi":       float(delta_Phi),
+            "min_peer_dist":   float(min_peer_dist),
+
+            "min_clear":       float(min_clear),
+            "clear_obs":       float(clear_obs),
+            "clear_wall":      float(clear_wall),
+            "peer_risk":       float(peer_risk),
+            "obst_risk":       float(obst_risk),
+
+            "speed":           float(speed),
+            "speed_norm":      float(speed_norm),
+            "in_peer_danger":  bool(in_peer_danger),
+            "in_obst_danger":  bool(in_obst_danger),
         }
 
         return float(reward), info
@@ -752,6 +801,7 @@ class MARL_SIM(SIM_ENV):
         if robot_goals is not None:
             assert len(robot_goals) == self.num_robots
         
+        self.start_goal_cache = []
         if robot_states is not None and robot_goals is not None:
             for i, state in enumerate(robot_states):
                 self.robot_list[i].set_state(state=np.array(state), init=True)
@@ -767,7 +817,6 @@ class MARL_SIM(SIM_ENV):
         self.robot_times = torch.zeros(self.num_robots, dtype=torch.int32)
         self.robot_terminateds = torch.zeros(self.num_robots, dtype=torch.bool)
         self.robot_truncateds = torch.zeros(self.num_robots, dtype=torch.bool)
-        self.robot_last_action = np.zeros((self.num_robots, 2), dtype=np.float32)
         self.robot_last_obst_loss = torch.zeros(self.num_robots, dtype=torch.float32)
 
         positions = []
@@ -780,14 +829,18 @@ class MARL_SIM(SIM_ENV):
         goals = np.asarray(goals, dtype=np.float32)
 
         # 初始化每个机器人的初始 goal 距离
+        # 初始化Time Field时间缓存 T_i(0) 和势场 Φ_i(0)
         for i in range(self.num_robots):
             dis = np.linalg.norm(goals[i] - positions[i])
             self.robot_last_goal_dist[i] = float(dis)
 
-        # 初始化Time Field时间缓存 T_i(0) 和势场 Φ_i(0)
-        for i in range(self.num_robots):
-            T0, _ = self._compute_travel_time_and_prior_dir(positions[i], goals[i])
+            min_clear, _, _ = self._min_surface_clearance_static(i)
+            self.robot_last_obst_loss[i] = min_clear
+
+            T0, prior0 = self._compute_travel_time_and_prior_dir(positions[i], goals[i])
             self.robot_last_T[i] = float(T0)
+            self.robot_last_prior_dir[i] = prior0
+
             Phi0, _, _ = self._compute_peer_potential(i)
             self.robot_last_peer_phi[i] = float(Phi0)
 
@@ -804,33 +857,50 @@ class MARL_SIM(SIM_ENV):
         self,
         robot,
         robot_state=None,
-        robot_goal=None
+        robot_goal=None,
+        dis_tol=1.5,
+        max_attempts=200
     ):
+        def is_valid_pos(pos):
+            for sg in self.start_goal_cache:
+                if np.linalg.norm(pos - sg) < dis_tol:
+                    return False
+            return True
+        
         if robot_state is not None:
             robot.set_state(np.array(robot_state), init=True)
         else:
-            free_pos = robot.get_random_free_position(
-                self.env.objects,
-                free = True,
-                range_limits=[
-                    [self.x_range[0] + 1, self.y_range[0] + 1, 0],
-                    [self.x_range[1] - 1, self.y_range[1] - 1, 0],
-                ],
-            )
+            for _ in range(max_attempts):
+                free_pos = robot.get_random_free_position(
+                    self.env.objects,
+                    free = True,
+                    filter_start_goal = True,
+                    range_limits=[
+                        [self.x_range[0] + 1, self.y_range[0] + 1, 0],
+                        [self.x_range[1] - 1, self.y_range[1] - 1, 0],
+                    ],
+                )
+                if is_valid_pos(free_pos):
+                    self.start_goal_cache.append(free_pos)
+                    break
             robot.set_state(free_pos, init=True)
             
         if robot_goal is not None:
             robot.set_goal(np.array(robot_goal), init=True)
         else:
-            free_pos = robot.get_random_free_position(
-                self.env.objects,
-                free = True,
-                filter_goal = True,
-                range_limits=[
-                    [self.x_range[0] + 1, self.y_range[0] + 1, 0],
-                    [self.x_range[1] - 1, self.y_range[1] - 1, 0],
-                ],
-            )
+            for _ in range(max_attempts):
+                free_pos = robot.get_random_free_position(
+                    self.env.objects,
+                    free = True,
+                    filter_start_goal = True,
+                    range_limits=[
+                        [self.x_range[0] + 1, self.y_range[0] + 1, 0],
+                        [self.x_range[1] - 1, self.y_range[1] - 1, 0],
+                    ],
+                )
+                if is_valid_pos(free_pos):
+                    self.start_goal_cache.append(free_pos)
+                    break
             robot.set_goal(free_pos, init=True)
         # 重置碰撞等信息
         robot.reset()

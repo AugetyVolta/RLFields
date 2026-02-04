@@ -2,7 +2,7 @@ import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.models import ModelCatalog
 
-from model.policy_value_network import RLFieldsActorModel
+from model.policy_value_network_new_new import RLFieldsActorModel
 from env.multi_robot_env import MultiRobotEnv
 from env.params import SceneConfig
 
@@ -32,6 +32,9 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
                 "custom_model_config": cfg.get_network_config(),
             },
             lr=cfg.algorithm_params.lr,
+            gamma=cfg.algorithm_params.gamma,
+            num_epochs=cfg.algorithm_params.num_epochs,
+            minibatch_size=cfg.algorithm_params.minibatch_size,
             train_batch_size=cfg.algorithm_params.train_batch_size,
             use_gae=cfg.algorithm_params.use_gae,
             lambda_=cfg.algorithm_params.lambda_,

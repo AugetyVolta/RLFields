@@ -3,7 +3,6 @@ import shutil
 from datetime import datetime
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
-from env.sim.marl_sim_env import RewardLogCallbacks
 from model.policy_value_network import RLFieldsActorModel
 from ray.rllib.models import ModelCatalog
 from ray.tune.logger import UnifiedLogger
@@ -52,7 +51,9 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
                 "custom_model_config": cfg.get_network_config(),
             },
             lr=cfg.algorithm_params.lr,
-
+            gamma=cfg.algorithm_params.gamma,
+            num_epochs=cfg.algorithm_params.num_epochs,
+            minibatch_size=cfg.algorithm_params.minibatch_size,
             train_batch_size=cfg.algorithm_params.train_batch_size,
             use_gae=cfg.algorithm_params.use_gae,
             lambda_=cfg.algorithm_params.lambda_,
@@ -114,7 +115,7 @@ def prepare_exp(cfg: SceneConfig, resume_exp_name = None):
     return algo, exp_info
 
 if __name__ == "__main__":
-    resume_exp_name = None #'multi_robot_ppo_20251210_075223' # 'multi_robot_ppo_20251201_213430' # 'multi_robot_ppo_20251201_101531' # 'multi_robot_ppo_20251129_155326'
+    resume_exp_name = None
     resume_it = 19
     restore_ckpt_path = '/home/zby/桌面/iter_000116'
 

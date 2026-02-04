@@ -6,7 +6,7 @@ import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.models import ModelCatalog
 
-from model.policy_value_network import RLFieldsActorModel
+from model.policy_value_network_new_new import RLFieldsActorModel
 from env.multi_robot_env import MultiRobotEnv
 from env.params import SceneConfig
 

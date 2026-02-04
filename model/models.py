@@ -34,34 +34,42 @@ class ObstacleEncoder(nn.Module):
     def forward(self, sdf: torch.Tensor) -> torch.Tensor:
         if sdf.dim() == 3:  # [B,H,W] -> [B,1,H,W]
             sdf = sdf.unsqueeze(1)
-        feats = self.feature_extractor(sdf)          # [B,C,H,W]
-        pooled = self.global_pool(feats).flatten(1)  # [B,C]
-        return self.embedding_head(pooled)           # [B,D]
+        feats = self.feature_extractor(sdf)                 # [B, C, 20, 20]
+        pooled = self.global_pool(feats).flatten(1)         # [B, C]
+        global_emb = self.embedding_head(pooled)            # [B, D]
+        tokens = feats.flatten(2).transpose(1, 2)           # [B, 400, C]
+        return global_emb, tokens
 
 class NeighborEncoder(nn.Module):
     """
-    邻居信息注意力编码器：
-    - self_obs      : [B, self_obs_dim]
-    - neighbor_obs  : [B, K, neighbor_obs_dim]
-    - neighbor_mask : [B, K] (可选，1=真实邻居, 0=填充)
+    邻居信息注意力编码器（修复 M=0 的 mask-softmax + 可返回 neighbor tokens）
+
+    输入:
+      - self_obs      : [B, self_obs_dim]
+      - neighbor_obs  : [B, K, neighbor_obs_dim]
+      - neighbor_mask : [B, K] (可选) 1=真实邻居, 0=padding
+
     输出:
-    - final_neigh_emb: [B, neighbor_hidden_size]
+      - neigh_global  : [B, H]      (聚合后的邻居特征，全局邻居 embedding)
+      - neigh_tokens  : [B, K, H]   (每个邻居一个 token；padding 邻居为 0)
+      - attn_weights  : [B, K]      (每个邻居的注意力权重；padding 为 0)
     """
-    def __init__(self, 
-                 self_obs_dim: int = 4, 
-                 neighbor_obs_dim: int = 4,
-                 neighbor_hidden_size: int = 128, 
-                 num_use_neighbor_obs: int = 6) -> None:
-        
+    def __init__(
+        self,
+        self_obs_dim: int = 4,
+        neighbor_obs_dim: int = 4,
+        neighbor_hidden_size: int = 128,
+        num_use_neighbor_obs: int = 6,
+    ) -> None:
         super().__init__()
         self.self_obs_dim = self_obs_dim
         self.neighbor_obs_dim = neighbor_obs_dim
         self.neighbor_hidden_size = neighbor_hidden_size
-        self.num_use_neighbor_obs = num_use_neighbor_obs  # K 最大邻居数
+        self.num_use_neighbor_obs = num_use_neighbor_obs
 
         H = neighbor_hidden_size
 
-        # e_i = MLP([self_obs, neighbor_obs])
+        # e_i = MLP([self_obs, neighbor_obs_i])  -> 邻居 token embedding
         self.embedding_mlp = nn.Sequential(
             nn.Linear(self_obs_dim + neighbor_obs_dim, H),
             nn.SiLU(),
@@ -69,7 +77,7 @@ class NeighborEncoder(nn.Module):
             nn.SiLU(),
         )
 
-        # h_i = MLP(e_i)
+        # h_i = MLP(e_i) -> 用于做加权求和的 value
         self.neighbor_value_mlp = nn.Sequential(
             nn.Linear(H, H),
             nn.SiLU(),
@@ -77,168 +85,349 @@ class NeighborEncoder(nn.Module):
             nn.SiLU(),
         )
 
-        # score([e_i, e_m]) -> 标量
+        # score([e_i, e_m]) -> 标量打分（注意力 logit）
         self.attention_mlp = nn.Sequential(
-            nn.Linear(H * 2, H),
+            nn.Linear(2 * H, H),
             nn.SiLU(),
             nn.Linear(H, H),
             nn.SiLU(),
             nn.Linear(H, 1),
         )
 
-    def forward(self, self_obs, neighbor_obs, neighbor_mask=None):
+    @staticmethod
+    def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps: float = 1e-6):
         """
-        self_obs      : [B, self_obs_dim]
-        neighbor_obs  : [B, K, neighbor_obs_dim]  (K = num_use_neighbor_obs)
-        neighbor_mask : [B, K] (float/bool，可为 None，None 表示都有效)
+        scores: [B, K]
+        mask  : [B, K]  (0/1 或 bool)
+        返回:
+          weights: [B, K]，当某个 batch 没有有效邻居时，全 0（不会泄漏 padding）
+        """
+        mask = mask.to(dtype=scores.dtype)
+
+        # 数值稳定：减去每行最大值（不影响 softmax）
+        scores = scores - scores.max(dim=dim, keepdim=True).values
+
+        exp_scores = torch.exp(scores) * mask              # 无效邻居直接置 0
+        denom = exp_scores.sum(dim=dim, keepdim=True).clamp_min(eps)
+        weights = exp_scores / denom
+
+        # 关键：如果整行 mask 全 0，则 exp_scores 全 0 -> weights 全 0（不会变成均匀分布）
+        return weights
+
+    def forward(self, self_obs, neighbor_obs, neighbor_mask=None, return_tokens: bool = True):
+        """
+        self_obs      : [B, Ds]
+        neighbor_obs  : [B, K, Dn]
+        neighbor_mask : [B, K] (可选)
         """
         B, K, Dn = neighbor_obs.shape
         assert K == self.num_use_neighbor_obs, f"K mismatch: {K} vs {self.num_use_neighbor_obs}"
         assert Dn == self.neighbor_obs_dim, f"neighbor_obs_dim mismatch: {Dn} vs {self.neighbor_obs_dim}"
 
-        # 1) [self, neighbor_i] -> e_i
-        self_obs_expanded = self_obs.unsqueeze(1).expand(B, K, self.self_obs_dim)
-        mlp_input = torch.cat([self_obs_expanded, neighbor_obs], dim=-1)  # [B, K, Ds+Dn]
-        mlp_input = mlp_input.reshape(B * K, -1)                          # [B*K, Ds+Dn]
-
-        neighbor_embeddings = self.embedding_mlp(mlp_input)               # e_i: [B*K, H]
-        neighbor_values = self.neighbor_value_mlp(neighbor_embeddings)    # h_i: [B*K, H]
-
-        # 2) e_m: 邻居 embedding 的均值 (带 mask)
-        e_i = neighbor_embeddings.view(B, K, self.neighbor_hidden_size)   # [B, K, H]
-
+        # --------- mask 处理 ---------
         if neighbor_mask is None:
-            neighbor_mask = torch.ones(B, K, device=e_i.device, dtype=e_i.dtype)
+            neighbor_mask = torch.ones(B, K, device=neighbor_obs.device, dtype=torch.bool)
         else:
-            neighbor_mask = neighbor_mask.to(e_i.dtype)
+            neighbor_mask = neighbor_mask.to(device=neighbor_obs.device).bool()
 
-        mask = neighbor_mask.unsqueeze(-1)                                # [B, K, 1]
-        denom = mask.sum(dim=1, keepdim=True).clamp_min(1e-6)             # [B, 1, 1]
-        e_m = (e_i * mask).sum(dim=1, keepdim=True) / denom               # [B, 1, H]
-        e_m_repeat = e_m.expand(B, K, self.neighbor_hidden_size)          # [B, K, H]
+        mask_f = neighbor_mask.to(dtype=neighbor_obs.dtype).unsqueeze(-1)  # [B,K,1]
 
-        # 3) score([e_i, e_m]) -> alpha_i
-        att_input = torch.cat([e_i, e_m_repeat], dim=-1)                  # [B, K, 2H]
-        att_input = att_input.reshape(B * K, -1)                          # [B*K, 2H]
-        scores = self.attention_mlp(att_input).view(B, K)                 # [B, K]
+        # --------- 1) e_i: 每个邻居 token embedding ---------
+        self_obs_expanded = self_obs.unsqueeze(1).expand(B, K, self.self_obs_dim)   # [B,K,Ds]
+        mlp_input = torch.cat([self_obs_expanded, neighbor_obs], dim=-1)            # [B,K,Ds+Dn]
+        e_i = self.embedding_mlp(mlp_input.view(B * K, -1)).view(B, K, -1)          # [B,K,H]
 
-        scores = scores.masked_fill(neighbor_mask == 0, -1e9)
-        attn_weights = torch.softmax(scores, dim=1).unsqueeze(-1)         # [B, K, 1]
+        # padding 的 token 直接清零（避免后续任何泄漏）
+        e_i = e_i * mask_f
 
-        # 4) ∑ alpha_i * h_i
-        h_i = neighbor_values.view(B, K, self.neighbor_hidden_size)       # [B, K, H]
-        weighted = h_i * attn_weights                                     # [B, K, H]
-        final_neighborhood_embedding = weighted.sum(dim=1)                # [B, H]
+        # --------- 2) h_i: value ---------
+        h_i = self.neighbor_value_mlp(e_i.view(B * K, -1)).view(B, K, -1)           # [B,K,H]
+        h_i = h_i * mask_f
 
-        return final_neighborhood_embedding
+        # --------- 3) e_m: 有效邻居均值 embedding ---------
+        denom = mask_f.sum(dim=1, keepdim=True).clamp_min(1e-6)                     # [B,1,1]
+        e_m = (e_i * mask_f).sum(dim=1, keepdim=True) / denom                       # [B,1,H]
+        e_m_repeat = e_m.expand(B, K, self.neighbor_hidden_size)                    # [B,K,H]
+
+        # --------- 4) scores -> masked-softmax 权重 ---------
+        att_in = torch.cat([e_i, e_m_repeat], dim=-1)                               # [B,K,2H]
+        scores = self.attention_mlp(att_in.view(B * K, -1)).view(B, K)              # [B,K]
+
+        # 只对有效邻居做 softmax（M=0 时 weights 全 0）
+        attn_weights = self._masked_softmax(scores, neighbor_mask, dim=1)           # [B,K]
+        attn_weights = attn_weights * neighbor_mask.to(attn_weights.dtype)          # [B,K] 再保险
+
+        # --------- 5) 加权聚合得到全局邻居特征 ---------
+        neigh_global = (h_i * attn_weights.unsqueeze(-1)).sum(dim=1)                # [B,H]
+
+        if return_tokens:
+            neigh_tokens = e_i                                                     # [B,K,H]
+            return neigh_global, neigh_tokens, attn_weights
+        else:
+            return neigh_global
 
 class EnvEncoder(nn.Module):
-    def __init__(self, 
-                 self_obs_dim=4,
-                 self_obs_embed_dim=128, 
-                 neighbor_obs_dim=4, 
-                 neighbor_hidden_size=128, 
-                 neighbor_base_channels=32,
-                 obstacle_embedding_dim=128, 
-                 n_head=6, 
-                 num_use_neighbor_obs=6,
-                 env_output_feature=128):  # env_output_feature 用于设置最后输出的特征维度
-        super(EnvEncoder, self).__init__()
-        assert self_obs_dim % 2 == 0, "self_obs_dim 必须是偶数，用于平分 start / goal"
+    """
+    输出 4 路特征拼接后的 env embedding:
 
-        # 将初始化的参数存储为类属性
+      self_feat            : self_obs 编码
+      obs_global           : SDF 全局 embedding
+      neigh_global         : 邻居聚合（邻居本身信息）
+      neigh_delta_global   : 邻居从障碍中检索到的“增量修正”(纯 ctx 聚合)
+
+    最终 out: [B, env_output_feature]
+    """
+    def __init__(
+        self,
+        self_obs_dim=4,
+        self_obs_embed_dim=128,
+        neighbor_obs_dim=4,
+        neighbor_hidden_size=128,
+        neighbor_base_channels=32,
+        obstacle_embedding_dim=128,
+        n_head=4,
+        num_use_neighbor_obs=6,
+        env_output_feature=128,
+        dropout=0.1,
+    ):
+        super().__init__()
+        assert n_head in (4, 8), "建议只用 n_head=4 或 8"
+        assert self_obs_dim % 2 == 0, "self_obs_dim 必须是偶数"
+
         self.self_obs_dim = self_obs_dim
         self.self_obs_embed_dim = self_obs_embed_dim
-        self.half_dim = self_obs_dim // 2   # self_obs_dim 的一半
+        self.half_dim = self_obs_dim // 2
+
         self.neighbor_obs_dim = neighbor_obs_dim
         self.neighbor_hidden_size = neighbor_hidden_size
-        self.neighbor_base_channels = neighbor_base_channels
-        self.obstacle_embedding_dim = obstacle_embedding_dim
-        self.n_head = n_head
         self.num_use_neighbor_obs = num_use_neighbor_obs
-        self.env_output_feature = env_output_feature  # 新增的输出特征维度
 
-        # 本机状态编码器（MLP)
+        self.obstacle_embedding_dim = obstacle_embedding_dim
+        self.neighbor_base_channels = neighbor_base_channels
+
+        # 1) self 编码
         self.embed_encoder = nn.Sequential(
-            nn.Linear(self.self_obs_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.self_obs_embed_dim)
+            nn.Linear(self_obs_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, self_obs_embed_dim),
+        )
+        self.self_ln = nn.LayerNorm(self_obs_embed_dim)
+
+        # 2) obstacle 编码
+        self.obstacle_encoder = ObstacleEncoder(
+            embedding_dim=obstacle_embedding_dim,
+            base_channels=neighbor_base_channels,
+        )
+        self.obs_global_ln = nn.LayerNorm(obstacle_embedding_dim)
+
+        # obstacle tokens: [B,M,C] -> [B,M,d_model]
+        self.obstacle_token_proj = nn.Sequential(
+            nn.Linear(neighbor_base_channels, neighbor_hidden_size),
+            nn.LayerNorm(neighbor_hidden_size),
         )
 
-        # 障碍物编码器
-        self.obstacle_encoder = ObstacleEncoder(embedding_dim=self.obstacle_embedding_dim,
-                                                base_channels=neighbor_base_channels)
+        # 3) neighbor 编码
+        self.neighbor_encoder = NeighborEncoder(
+            self_obs_dim=self_obs_dim,
+            neighbor_obs_dim=neighbor_obs_dim,
+            neighbor_hidden_size=neighbor_hidden_size,
+            num_use_neighbor_obs=num_use_neighbor_obs,
+        )
+        self.neigh_global_ln = nn.LayerNorm(neighbor_hidden_size)
 
-        # 再投影到 neighbor_hidden_size 以匹配 d_model
-        self.obstacle_proj = nn.Linear(
-            self.obstacle_embedding_dim, self.neighbor_hidden_size
+        # 4) CrossAttention
+        assert neighbor_hidden_size % n_head == 0, "neighbor_hidden_size 必须能整除 n_head"
+        head_dim = neighbor_hidden_size // n_head
+
+        self.cross_attention = CrossAttention(
+            n_head=n_head,
+            d_model=neighbor_hidden_size,
+            d_k=head_dim,
+            d_v=head_dim,
+            dropout=dropout,
         )
 
-        # 邻居信息编码器
-        self.neighbor_encoder = NeighborEncoder(self_obs_dim=self.self_obs_dim,
-                                                neighbor_obs_dim=self.neighbor_obs_dim,
-                                                neighbor_hidden_size=self.neighbor_hidden_size,
-                                                num_use_neighbor_obs=self.num_use_neighbor_obs)
+        # 5) delta LN + 可学习缩放（你想永远保留增量也没问题，默认 1）
+        self.delta_alpha = nn.Parameter(torch.tensor(1.0))
+        self.delta_ln = nn.LayerNorm(neighbor_hidden_size)
 
-        # Cross-Attention 模块
-        self.cross_attention = CrossAttention(n_head=self.n_head, 
-                                              d_model=self.neighbor_hidden_size, 
-                                              d_k=self.neighbor_hidden_size, 
-                                              d_v=self.neighbor_hidden_size)
+        # 6) fusion
+        fusion_in = (
+            self_obs_embed_dim
+            + obstacle_embedding_dim
+            + neighbor_hidden_size
+            + neighbor_hidden_size
+        )
 
-        # 融合后的全连接层
         self.fusion_mlp = nn.Sequential(
-            nn.Linear(self.self_obs_embed_dim + self.obstacle_embedding_dim + self.neighbor_hidden_size, 256),
-            nn.ReLU(),
+            nn.Linear(fusion_in, 256),
+            nn.ReLU(inplace=True),
             nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, self.env_output_feature)
+            nn.ReLU(inplace=True),
+            nn.Linear(128, env_output_feature),
         )
 
     def forward(self, self_obs, neighbor_obs, sdf_input, neighbor_mask):
         """
-        self_obs      : 本机状态 [B, self_obs_dim]
-        neighbor_obs  : 邻居信息 [B, K, neighbor_obs_dim]
-        sdf_input     : 障碍物信息（SDF） [B, 1, H, M]
-        neighbor_mask : 邻居有效标记 [B, K]
+        self_obs      : [B, self_obs_dim]
+        neighbor_obs  : [B, K, neighbor_obs_dim]
+        sdf_input     : [B, 1, H, W]   (SDF 已经归一化到[0,1])
+        neighbor_mask : [B, K] bool / 0-1
         """
-        # ---- 0) self_obs: [start, goal] -> [start, goal_rel] ----
-        start = self_obs[:, :self.half_dim]          # [B, D/2]
-        goal  = self_obs[:, self.half_dim:]          # [B, D/2]
-        goal_rel = goal - start                      # [B, D/2]
+        B = self_obs.size(0)
+        K = neighbor_obs.size(1)
 
-        # 重新拼成 self_obs_proc，维度仍然是 self_obs_dim
-        self_obs_proc = torch.cat([start, goal_rel], dim=-1)  # [B, self_obs_dim]
-        # 本机状态编码 用绝对位置和相对目标位置
-        self_obs_encoding = self.embed_encoder(self_obs_proc)  # [B, self_obs_embed_dim]
+        # 0) self_obs -> start + goal_rel
+        start = self_obs[:, :self.half_dim]
+        goal  = self_obs[:, self.half_dim:]
+        goal_rel = goal - start
+        self_obs_proc = torch.cat([start, goal_rel], dim=-1)
 
-        # 处理障碍物信息（SDF），输入格式 [B, 1, H, M]
-        obstacle_embedding = self.obstacle_encoder(sdf_input)          # [B, obstacle_embedding_dim]
-        obstacle_tokens = self.obstacle_proj(obstacle_embedding)       # [B, neighbor_hidden_size]
-        obstacle_tokens = obstacle_tokens.unsqueeze(1)                 # [B, 1, neighbor_hidden_size]
+        # 1) self_feat
+        self_feat = self.self_ln(self.embed_encoder(self_obs_proc))  # [B, Ds_emb]
 
-        # 处理邻居信息, 邻居pos和goal都是相对位置，自身观测用绝对位置和相对目标位置
-        neighbor_embedding = self.neighbor_encoder(self_obs=self_obs_proc,  # [B, self_obs_dim]
-                                                   neighbor_obs=neighbor_obs,  # [B, K, neighbor_obs_dim]
-                                                   neighbor_mask=neighbor_mask)  # [B, neighbor_hidden_size]
-        neighbor_q = neighbor_embedding.unsqueeze(1)                   # [B, 1, neighbor_hidden_size]
+        # 2) obstacle global + tokens
+        obs_global, obs_tokens = self.obstacle_encoder(sdf_input)    # obs_tokens: [B,M,C]
+        obs_global = self.obs_global_ln(obs_global)
+        obs_tokens_proj = self.obstacle_token_proj(obs_tokens)       # [B,M,d_model]
 
-        # Cross-Attention 处理邻居信息和障碍物信息
-        attn_out, _ = self.cross_attention(
-            query=neighbor_q,
-            key=obstacle_tokens,
-            value=obstacle_tokens,
-            mask=None
-        )                                                         # [B, 1, neighbor_hidden_size]
-        attended_neighbor_features = attn_out.squeeze(1)          # [B, neighbor_hidden_size]
+        # 3) neighbor global + tokens + weights
+        neigh_global, neigh_tokens, neigh_w = self.neighbor_encoder(
+            self_obs=self_obs_proc,
+            neighbor_obs=neighbor_obs,
+            neighbor_mask=neighbor_mask,
+            return_tokens=True,
+        )
+        neigh_global = self.neigh_global_ln(neigh_global)
+        # neigh_tokens: [B,K,d_model] padding 已经清零
+        # neigh_w     : [B,K] padding=0，有效邻居时 sum=1；无邻居时全 0
 
-        # 拼接本机状态编码、邻居信息（经过交叉注意力处理）和障碍物信息
-        combined_features = torch.cat([self_obs_encoding, attended_neighbor_features, obstacle_embedding], dim=-1)
+        # qmask（只用于防止 padding query 被写入非 0）
+        if neighbor_mask is None:
+            qmask_f = torch.ones(B, K, device=self_obs.device, dtype=neigh_tokens.dtype)
+        else:
+            qmask_f = neighbor_mask.to(device=self_obs.device, dtype=neigh_tokens.dtype)
 
-        # 通过全连接层进行最终的处理
-        output = self.fusion_mlp(combined_features)  # [B, env_output_feature]
+        # 4) neighbor_tokens -> query obstacle_tokens
+        # ✅ 取回纯 ctx（纯增量项）
+        _, attn, ctx_tokens = self.cross_attention(
+            query=neigh_tokens,          # [B,K,d_model]
+            key=obs_tokens_proj,         # [B,M,d_model]
+            value=obs_tokens_proj,       # [B,M,d_model]
+            mask=None,
+            return_ctx=True,
+        )  # ctx_tokens: [B,K,d_model]
+        
+        ctx_tokens = ctx_tokens * qmask_f.unsqueeze(-1)
 
-        return output
+        # --- 5) 聚合 “障碍感知的增量修正” ---
+        ctx_strength = ctx_tokens.norm(p=2, dim=-1)                      # [B, K]
+        w_obst = neigh_w * (ctx_strength + 1e-3)                         # [B, K]  障碍感知权重
+        w_obst = w_obst / w_obst.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        neigh_delta_global = (ctx_tokens * w_obst.unsqueeze(-1)).sum(dim=1)  # [B, d_model]
+        neigh_delta_global = self.delta_ln(self.delta_alpha * neigh_delta_global)
+        
+        from utils.eval_attention import CrossAttnSDFVis, analyze_cross_attn_vs_sdf, analyze_attn_similarity,debug_query_attn_ctx_similarity, analyze_query_attn_ctx_invariance, debug_attn_entropy_and_logits
+        vis = CrossAttnSDFVis(sdf_scale=4.0, attn_alpha=0.55)
+    
+        # # 聚合 attention（并列SDF）
+        # vis.show_aggregated(
+        #     sdf_input=sdf_input,             # ✅ 直接传网络输入的SDF
+        #     attn_weights=attn,
+        #     neighbor_mask=neighbor_mask,     # 建议传
+        #     b=0,
+        #     agg="mean_valid",
+        #     extent=None,                     # 你说不要坐标的话就None
+        #     fname="logs/attn_agg_pair.png",
+        # )
+
+        # # 单邻居 attention（强烈建议逐个看）
+        # vis.show_single_neighbor(
+        #     sdf_input=sdf_input,
+        #     attn_weights=attn,
+        #     b=0,
+        #     k=2,
+        #     head=None,
+        #     extent=None,
+        #     fname="logs/attn_k2_pair.png",
+        # )
+
+        # vis.show_valid_neighbors_heads_grid(
+        #     sdf_input=sdf_input,
+        #     attn_weights=attn,
+        #     neighbor_mask=neighbor_mask,
+        #     b=0,
+        #     extent=None,
+        #     out_dir="logs",
+        #     prefix="attn_grid",
+        # )
+
+        # analyze_attn_similarity(
+        #     attn_weights=attn,                 # [B,H,K,M]
+        #     neigh_tokens=neigh_tokens,         # [B,K,d_model]
+        #     ctx_tokens=ctx_tokens,             # [B,K,d_model]
+        #     neighbor_mask=neighbor_mask,       # [B,K] bool
+        #     cross_attn_module=self.cross_attention,
+        #     b=0,
+        #     topk=30,
+        # )
+
+        # import time
+        # time.sleep(2)
+
+        # debug_query_attn_ctx_similarity(
+        #     neigh_tokens=neigh_tokens.detach(),
+        #     attn=attn.detach(),
+        #     ctx_tokens=ctx_tokens.detach(),
+        #     neighbor_mask=neighbor_mask,
+        #     b=0,
+        #     pair_mode="all_pairs",  # 或 "vs_first"
+        #     print_top=30,
+        # )
+
+        # analyze_query_attn_ctx_invariance(
+        #     cross_attn=self.cross_attention,
+        #     neigh_tokens=neigh_tokens,
+        #     obs_tokens_proj=obs_tokens_proj,
+        #     attn_weights=attn,
+        #     ctx_tokens=ctx_tokens,
+        #     neighbor_mask=neighbor_mask,
+        #     b=0,
+        # )
+
+        # debug_attn_entropy_and_logits(self.cross_attention, neigh_tokens, obs_tokens_proj, attn, neighbor_mask, b=0)
+
+
+        # # neigh_w 聚合
+        # analyze_cross_attn_vs_sdf(
+        #     sdf_input=sdf_input,
+        #     attn_weights=attn,
+        #     neighbor_mask=neighbor_mask,
+        #     neighbor_weights=neigh_w.detach(),
+        #     b=0,
+        # )
+
+        # # w_obst 聚合（更贴近你最终 delta 聚合逻辑）
+        # analyze_cross_attn_vs_sdf(
+        #     sdf_input=sdf_input,
+        #     attn_weights=attn,
+        #     neighbor_mask=neighbor_mask,
+        #     neighbor_weights=w_obst.detach(),
+        #     b=0,
+        # )
+        # print('tokens', neigh_tokens)
+        # print('weight', attn)
+        # debug_projected_q_cos(self.cross_attention, neigh_tokens, neighbor_mask, b=0, k0=0, k1=1)
+        # debug_value_token_diversity(obs_tokens_proj, b=0)
+
+        # 6) 4 路融合
+        fused = torch.cat(
+            [self_feat, obs_global, neigh_global, neigh_delta_global],
+            dim=-1,
+        )
+        out = self.fusion_mlp(fused)
+        return out
 
 class FiLM1d(nn.Module):
     """
@@ -391,7 +580,7 @@ class RLFields(nn.Module):
         neighbor_hidden_size: int = 128, 
         neighbor_base_channels: int = 32,
         obstacle_embedding_dim: int = 128, 
-        n_head: int = 6, 
+        n_head: int = 4, 
         num_use_neighbor_obs: int = 6,
         env_output_feature: int = 128,
         fusion_mode: str = "film",
@@ -510,8 +699,10 @@ class RLFields(nn.Module):
         idx = idx.expand(B, -1)                                  # [B, K]
         neighbor_mask = idx < neighbor_valid_num.unsqueeze(-1)   # [B, K] bool
 
-        # -------- 3) 解析 SDF --------
-        sdf_flat = observations[:, offset:]                       # [B, H*H]
+        # -------- 3) 解析 SDF + prior_dir --------
+        # obs 的最后 nt_dim 维是 env 预先计算好的 prior_dir，避免在 model 内重复计算。
+        prior_dir = observations[:, -self.nt_dim:]               # [B, nt_dim]
+        sdf_flat = observations[:, offset:-self.nt_dim]          # [B, H*H]
         sdf_len = sdf_flat.shape[1]
         H = int(math.sqrt(sdf_len))
         assert H * H == sdf_len, f"sdf_input 展平长度 {sdf_len} 不能组成正方形图像"
@@ -531,10 +722,7 @@ class RLFields(nn.Module):
         # -------- 6) LateFusionHead 门控融合 --------
         fused_feat = self.late_fusion(env_embedding, nt_feat)    # [B, nt_feat_dim]
 
-        # -------- 7) RLFields featrure和gradient融合输出特征 --------
-        gradient = self.ntfields_nn.calculate_gradient(self_obs) # [B, 4]
-
-        return fused_feat, gradient
+        return fused_feat, prior_dir
     
 # PC_Planner网络
 class NN(nn.Module):

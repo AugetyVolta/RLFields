@@ -41,13 +41,13 @@ class ESDF_2d:
         将点云转换为SDF（Signed Distance Field）。
 
         参数：
-            pointcloud: 2xN的点云数组，N为点的个数。
+            pointcloud: Nx2的点云数组，N为点的个数。
 
         返回：
             SDF网格
         """
         # 网格范围
-        x_min, x_max, y_min, y_max = self.grid_range[0], self.grid_range[1], self.grid_range[0], self.grid_range[1]
+        x_min, x_max, y_min, y_max = self.grid_range[0], self.grid_range[1], self.grid_range[2], self.grid_range[3]
         
         # 生成网格坐标
         x_grid, y_grid = np.meshgrid(np.arange(x_min, x_max, self.grid_size), 

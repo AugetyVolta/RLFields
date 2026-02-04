@@ -122,28 +122,32 @@ class CrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, return_ctx: bool = False):
         """
-        query: 来自邻居信息的输入，形状为 [B, K, d_model]
-        key: 来自SDF特征的输入，形状为 [B, M, d_model]
-        value: 来自SDF特征的输入，形状为 [B, M, d_model]
-        mask: 可选的掩码，形状为 [B, K]，用于指定哪些邻居是有效的
+        query: [B, K, d_model]
+        key  : [B, M, d_model]
+        value: [B, M, d_model]
+        mask : 可选（你现在不用也行）
+        return_ctx: True 时额外返回 ctx（纯增量项）
         """
-        B, K, _ = query.size()  # B 为批量大小，K 为邻居数量
+        B, K, _ = query.size()
 
-        # 将 Query, Key 和 Value 投影到多个头上
         q = self.w_qs(query).view(B, K, self.n_head, self.d_k).transpose(1, 2)  # [B, n_head, K, d_k]
-        k = self.w_ks(key).view(B, -1, self.n_head, self.d_k).transpose(1, 2)    # [B, n_head, M, d_k]
-        v = self.w_vs(value).view(B, -1, self.n_head, self.d_v).transpose(1, 2)  # [B, n_head, M, d_v]
+        k = self.w_ks(key).view(B, -1, self.n_head, self.d_k).transpose(1, 2)   # [B, n_head, M, d_k]
+        v = self.w_vs(value).view(B, -1, self.n_head, self.d_v).transpose(1, 2) # [B, n_head, M, d_v]
 
-        # 使用 Scaled Dot-Product Attention 计算加权求和
-        output, attn_weights = self.attention(q, k, v, mask=mask)  # [B, n_head, K, d_v]
+        attn_out, attn_weights = self.attention(q, k, v, mask=mask)  # [B, n_head, K, d_v]
 
-        # 合并所有头的输出
-        output = output.transpose(1, 2).contiguous().view(B, K, -1)  # [B, K, n_head * d_v]
-        output = self.dropout(self.fc(output))  # 通过线性层处理合并后的输出
-        output = output + query  # 残差连接
-        output = self.layer_norm(output)  # 层归一化
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, K, -1)  # [B, K, n_head*d_v]
 
-        return output, attn_weights
+        # ctx：纯“从 obstacle 检索到的上下文增量项”
+        ctx = self.dropout(self.fc(attn_out))  # [B, K, d_model]
+
+        # out：原版输出（残差 + LN）
+        out = self.layer_norm(ctx + query)     # [B, K, d_model]
+
+        if return_ctx:
+            return out, attn_weights, ctx
+        else:
+            return out, attn_weights
 

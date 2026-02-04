@@ -3,15 +3,17 @@ from torch import nn
 import torch.nn.functional as F
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 
-from .models import RLFields
+from .models_new_new import RLFields
 
 class RLFieldsActorModel(TorchModelV2, nn.Module):
     """
     PPO 的 actor-critic 模型封装：
-    - RLFields(obs) -> (fused_feat, grad_all)
+    - RLFields(obs_trunk) -> (fused_feat, prior_dir)
         fused_feat: 融合了 NTFields + 环境/邻居 的高维特征 [B, nt_feat_dim]
-        grad_all:   NTFields 在 (start, goal) 上的梯度 [B, 4]
-    - 策略：用 grad_start 做“先验方向”，再加 residual，得到动作均值；
+        prior_dir:  归一化后的先验方向 [B, nt_dim]（由 RLFields 直接返回）
+    - 策略：动作直接输出 (alpha, theta)，范围都在 [-1, 1]。
+      其中 alpha 后续在 env 中映射到 [0,1] 并乘 v_max 作为速度幅度；
+      theta 后续在 env 中映射到 [-pi,pi] 并以 prior direction 作为基准旋转。
       然后拼接 log_std 形成 logits。
     - 价值函数：用 fused_feat 做 value_head。
     """
@@ -47,7 +49,7 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
             neighbor_hidden_size=cfg.get("neighbor_hidden_size", 128),
             neighbor_base_channels=cfg.get("neighbor_base_channels", 32),
             obstacle_embedding_dim=cfg.get("obstacle_embedding_dim", 128),
-            n_head=cfg.get("n_head", 6),
+            n_head=cfg.get("n_head", 4),
             num_use_neighbor_obs=cfg.get("num_use_neighbor_obs", 6),
             env_output_feature=cfg.get("env_output_feature", 128),
             fusion_mode=cfg.get("fusion_mode", "film"),
@@ -65,41 +67,52 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         )
 
         # fused_feat 特征维度 = RLFields 里 fused_feat 的维度
-        self.fused_feat_dim = self.rlfields.nt_feat_dim
-        self.nt_dim = self.rlfields.nt_dim  # 一般是 2，对应 start 的维度
+        self.fused_feat_dim = self.rlfields.env_output_feature
+        self.nt_dim = self.rlfields.nt_dim  # 一般是 2，对应 prior_dir 的维度
 
-        # ==== 策略部分 ====
-        # 额外拼接的维度：g_dir(2) + g_norm(1)
-        extra_dim = self.nt_dim + 1
-        delta_input_dim = self.fused_feat_dim + extra_dim
-
-        # 从 [fused_feat, g_dir, g_norm] 学一个小残差 Δμ
-        self.delta_head = nn.Sequential(
-            nn.Linear(delta_input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, self.action_dim),
+        # ==== 先验 embedding 分支 ====
+        # 输入: prior_dir(2) 共 nt_dim 维（RLFields 返回的 prior_dir 已归一化，可直接用）
+        self.prior_embed_dim = 64
+        self.prior_mlp = nn.Sequential(
+            nn.Linear(self.nt_dim, self.prior_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.prior_embed_dim, self.prior_embed_dim),
         )
 
-        # 残差头的最后一层初始化得很“小”，避免一开始把先验打乱
-        last_linear = self.delta_head[-1]
-        nn.init.zeros_(last_linear.bias)
+        # ==== 残差头：输入 = fused_feat + prior_feat ====
+        delta_input_dim = self.fused_feat_dim + self.prior_embed_dim
+
+        # 从 [fused_feat, prior_feat] 输出动作均值 (alpha, theta)
+        self.delta_head = nn.Sequential(
+            nn.Linear(delta_input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, self.action_dim),
+            nn.Tanh(),  # 输出动作 α/θ ∈ [-1, 1]
+        )
+
+        # 动作头的最后一层初始化得很“小”，避免一开始把策略打乱
+        last_linear = self.delta_head[-2]  # 最后一个 Linear（Tanh 的前一层）
         with torch.no_grad():
-            last_linear.weight.mul_(0.1)
+            last_linear.weight.mul_(0.6)
+            # alpha/theta 初始都为 0：alpha 映射后约 0.5 幅度；theta≈0 贴近先验方向
+            last_linear.bias[0] = 0.0
+            last_linear.bias[1] = 0.0
 
         # log_std：全局可学参数，一开始噪声不要太大
         self.log_std_param = nn.Parameter(torch.zeros(self.action_dim))
         with torch.no_grad():
-            self.log_std_param.data.fill_(-1.0)
+            self.log_std_param[0] = -1.0
+            self.log_std_param[1] = -1.5
 
         # ==== 价值函数部分 ====
         self.value_head = nn.Sequential(
-            nn.Linear(self.fused_feat_dim, 128),
-            nn.ReLU(), 
-            nn.Linear(128, 128),
+            nn.Linear(self.fused_feat_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
         )
 
         # 缓存最近一次 trunk，用于 value_function()
@@ -113,31 +126,23 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         """
         obs = input_dict["obs"].float()
 
-        # RLFields: fused_feat + 全梯度
-        fused_feat, grad_all = self.rlfields(obs)   # fused_feat: [B, T], grad_all: [B,4]
+        # RLFields: 得到融合特征和先验方向（先验方向已归一化）
+        fused_feat, prior_dir = self.rlfields(obs)  # fused_feat: [B, T], prior_dir: [B, nt_dim]
         self._last_fused_feat = fused_feat
 
-        # 只用对 start 的梯度作为先验方向（前 nt_dim 维）
-        grad_start = grad_all[:, :self.nt_dim]              # [B, 2]
+        # ===== 先验 embedding =====
+        prior_feat = self.prior_mlp(prior_dir)  # [B, prior_embed_dim]
 
-        # 梯度模长，做一个简单缩放
-        g_norm = torch.norm(grad_start, dim=-1, keepdim=True)  # [B, 1]
-        g_dir  = grad_start / (g_norm + 1e-6)                  # 单位方向 [B, 2]
+        # ===== policy head 输入：环境特征 + 先验 embedding =====
+        delta_in = torch.cat([fused_feat, prior_feat], dim=-1)  # [B, T + prior_embed_dim]
 
-        # 残差网络的输入：拼接全局特征 + 几何先验
-        delta_in = torch.cat([fused_feat, g_dir, g_norm], dim=-1)  # [B, fused_feat_dim + nt_dim + 1]
+        # 输出动作: [alpha_raw, theta_raw]，都在 [-1, 1]
+        # - alpha: env 里再做 (alpha+1)/2 -> [0,1]
+        # - theta: env 里再做 theta*pi -> [-pi, pi]
+        mu = self.delta_head(delta_in)  # [B, action_dim]
 
-        # 学一个小残差 Δμ
-        delta_mu = self.delta_head(delta_in)                     # [B, 2]
-        
-        # 最终均值：prior + residual
-        mu = grad_start + delta_mu                               # [B, 2]                  
-
-        # log_std：全局参数 broadcast
-        log_std = self.log_std_param.expand_as(mu)               # [B, 2]
-
-        # RLlib Gaussian 的 logits = [mean, log_std]
-        logits = torch.cat([mu, log_std], dim=-1)                # [B, 4]
+        log_std = self.log_std_param.expand_as(mu)
+        logits = torch.cat([mu, log_std], dim=-1)    # [B, 2*action_dim]
 
         return logits, state
 

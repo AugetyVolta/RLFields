@@ -20,7 +20,7 @@ class MultiRobotEnv(MultiAgentEnv):
         # observation dim
         self.neigh_flat_dim = self.num_use_neighbor_obs * self.neighbor_obs_dim
         self.sdf_flat_dim = self.H * self.H
-        self.obs_dim = self.self_obs_dim + self.neigh_flat_dim + 1 + self.sdf_flat_dim
+        self.obs_dim = self.self_obs_dim + self.neigh_flat_dim + 1 + self.sdf_flat_dim + self.action_dim # +2 for prior direction, same as action dim
 
         # robots
         self.agents = self.possible_agents = [f'robot_{i}' for i in range(self.num_robots)]
@@ -38,10 +38,11 @@ class MultiRobotEnv(MultiAgentEnv):
         else:
             raise ValueError(f"bad agent id: {agent_id}!")
     
+    # action是α和theta, 范围[-1, 1]
     def get_action_space(self, agent_id):
         if agent_id.startswith("robot_"):
-            return Box(low=-1.5,
-                       high=1.5,
+            return Box(low=-1.0,
+                       high=1.0,
                        shape=(self.action_dim,),
                        dtype=np.float32
                     )
