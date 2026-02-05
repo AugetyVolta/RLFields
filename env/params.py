@@ -66,11 +66,11 @@ class RLFieldsConfig:
     env_output_feature: int = 256
     fusion_mode: str = "concat_ln"
     # -------- SDF/Attention 增强 --------
-    use_sdf_grad: bool = True
+    use_sdf_grad: bool = False
     sdf_grad_scale: float = 1.0
     sdf_grad_clip: float | None = 1.0
-    use_ctx_ffn: bool = True
-    use_neigh_self_attn: bool = True
+    use_ctx_ffn: bool = False
+    use_neigh_self_attn: bool = False
     # -------- NTFields 配置 --------
     nt_dim: int = 2
     nt_vmax: float = 1.0

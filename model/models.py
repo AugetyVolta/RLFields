@@ -1,22 +1,31 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import math
 from .model_blocks import C_encoder_block, C_encoder_block_next, CrossAttention, UnetBaiscBlock
 
 class ObstacleEncoder(nn.Module):
     """
-    单通道 SDF 编码器（InstanceNorm2d，batch=1 友好）。
-    输入的esdf需要归一化到[0,1]
+    SDF 编码器（支持 SDF 梯度通道）。
+    - 输入的 esdf 需要归一化到[0,1]
+    - 可选: 追加 dSDF/dx, dSDF/dy 两个通道
     Conv2d(bias=False) → IN → SiLU；两次 stride=2 下采样 + 一次膨胀卷积。
     输出: [B, embedding_dim]
     """
     def __init__(self, 
                  embedding_dim: int = 128, 
-                 base_channels: int = 32)-> None:
+                 base_channels: int = 64,
+                 use_sdf_grad: bool = True,
+                 sdf_grad_scale: float = 8.0,
+                 sdf_grad_clip: float | None = 1.0)-> None:
         super().__init__()
         C = base_channels
+        self.use_sdf_grad = use_sdf_grad
+        self.sdf_grad_scale = sdf_grad_scale
+        self.sdf_grad_clip = sdf_grad_clip
+        in_ch = 3 if self.use_sdf_grad else 1
         self.feature_extractor = nn.Sequential(
-            nn.Conv2d(1, C, 3, padding=1, bias=False),
+            nn.Conv2d(in_ch, C, 3, padding=1, bias=False),
             nn.InstanceNorm2d(C, affine=True), nn.SiLU(),
 
             nn.Conv2d(C, C, 3, stride=2, padding=1, bias=False),  # 80→40
@@ -31,10 +40,31 @@ class ObstacleEncoder(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.embedding_head = nn.Linear(C, embedding_dim)
 
+    def _sdf_grad_2d(self, sdf: torch.Tensor) -> torch.Tensor:
+        """
+        sdf: [B,1,H,W] -> 返回 [B,2,H,W] (dx, dy)
+        中心差分 + replicate padding，避免边界尺寸变化。
+        """
+        sdf_p = F.pad(sdf, (1, 1, 1, 1), mode="replicate")
+        dx = (sdf_p[:, :, 1:-1, 2:] - sdf_p[:, :, 1:-1, :-2]) * 0.5
+        dy = (sdf_p[:, :, 2:, 1:-1] - sdf_p[:, :, :-2, 1:-1]) * 0.5
+        grad = torch.cat([dx, dy], dim=1)
+        if self.sdf_grad_scale != 1.0:
+            grad = grad * self.sdf_grad_scale
+        if self.sdf_grad_clip is not None:
+            grad = grad.clamp(-self.sdf_grad_clip, self.sdf_grad_clip)
+            
+        return grad
+
     def forward(self, sdf: torch.Tensor) -> torch.Tensor:
         if sdf.dim() == 3:  # [B,H,W] -> [B,1,H,W]
             sdf = sdf.unsqueeze(1)
-        feats = self.feature_extractor(sdf)                 # [B, C, 20, 20]
+        if self.use_sdf_grad:
+            grad = self._sdf_grad_2d(sdf)
+            x = torch.cat([sdf, grad], dim=1)
+        else:
+            x = sdf
+        feats = self.feature_extractor(x)                   # [B, C, 20, 20]
         pooled = self.global_pool(feats).flatten(1)         # [B, C]
         global_emb = self.embedding_head(pooled)            # [B, D]
         tokens = feats.flatten(2).transpose(1, 2)           # [B, 400, C]
@@ -59,7 +89,7 @@ class NeighborEncoder(nn.Module):
         self_obs_dim: int = 4,
         neighbor_obs_dim: int = 4,
         neighbor_hidden_size: int = 128,
-        num_use_neighbor_obs: int = 6,
+        num_use_neighbor_obs: int = 3,
     ) -> None:
         super().__init__()
         self.self_obs_dim = self_obs_dim
@@ -71,10 +101,9 @@ class NeighborEncoder(nn.Module):
 
         # e_i = MLP([self_obs, neighbor_obs_i])  -> 邻居 token embedding
         self.embedding_mlp = nn.Sequential(
-            nn.Linear(self_obs_dim + neighbor_obs_dim, H),
-            nn.SiLU(),
             nn.Linear(H, H),
             nn.SiLU(),
+            nn.Linear(H, H),
         )
 
         # h_i = MLP(e_i) -> 用于做加权求和的 value
@@ -82,7 +111,6 @@ class NeighborEncoder(nn.Module):
             nn.Linear(H, H),
             nn.SiLU(),
             nn.Linear(H, H),
-            nn.SiLU(),
         )
 
         # score([e_i, e_m]) -> 标量打分（注意力 logit）
@@ -93,6 +121,32 @@ class NeighborEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(H, 1),
         )
+
+        # ===================== NEW: 特征融合（防止 self_obs 压过 neighbor_obs） =====================
+        # 1) self / neighbor 分支分别投影到同一维度 H
+        self.self_proj = nn.Sequential(
+            nn.Linear(self_obs_dim, H),
+            nn.SiLU(),
+            nn.Linear(H, H),
+        )
+        self.neigh_proj = nn.Sequential(
+            nn.Linear(neighbor_obs_dim, H),
+            nn.SiLU(),
+            nn.Linear(H, H),
+        )
+
+        # 2) self 作为条件，对 neighbor 做 FiLM 调制（gamma/beta 初始很小）
+        self.film = nn.Linear(H, 2 * H)
+        nn.init.xavier_uniform_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+        self.gamma_scale = 0.1
+        self.beta_scale = 0.1
+
+        # 3) 可学习残差强度：保证表达能力，同时初期不会被 self 盖过
+        self.alpha = nn.Parameter(torch.tensor(0.05))
+
+        # 4) 你要的：最后对 token 再做一次 LN（稳定 scale）
+        self.token_ln = nn.LayerNorm(H, eps=1e-6)
 
     @staticmethod
     def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps: float = 1e-6):
@@ -133,15 +187,38 @@ class NeighborEncoder(nn.Module):
         mask_f = neighbor_mask.to(dtype=neighbor_obs.dtype).unsqueeze(-1)  # [B,K,1]
 
         # --------- 1) e_i: 每个邻居 token embedding ---------
-        self_obs_expanded = self_obs.unsqueeze(1).expand(B, K, self.self_obs_dim)   # [B,K,Ds]
-        mlp_input = torch.cat([self_obs_expanded, neighbor_obs], dim=-1)            # [B,K,Ds+Dn]
-        e_i = self.embedding_mlp(mlp_input.view(B * K, -1)).view(B, K, -1)          # [B,K,H]
+        # =============== NEW: self 条件化融合（neighbor 为主，self 不盖过） ===============
+        # neighbor base token: [B,K,H]
+        n0 = self.neigh_proj(neighbor_obs.reshape(B * K, Dn)).reshape(B, K, -1)
+
+        # self condition: [B,H]
+        s = self.self_proj(self_obs)  # self 对所有邻居相同，但只用来调制，不直接拼接进 token 主体
+
+        # FiLM 参数: [B,H] -> expand 到 [B,K,H]
+        gb = self.film(s)                                # [B,2H]
+        gamma, beta = gb.chunk(2, dim=-1)                # [B,H], [B,H]
+        gamma = self.gamma_scale * torch.tanh(gamma)     # 小幅度
+        beta  = self.beta_scale  * torch.tanh(beta)
+
+        gamma = gamma.unsqueeze(1).expand(B, K, -1)       # [B,K,H]
+        beta  = beta.unsqueeze(1).expand(B, K, -1)        # [B,K,H]
+
+        # neighbor 被 self 调制，但用 residual blend 控制强度（alpha 初始小）
+        n1 = n0 * (1.0 + gamma) + beta                    # [B,K,H]
+        e_i = n0 + self.alpha * (n1 - n0)                 # [B,K,H]
 
         # padding 的 token 直接清零（避免后续任何泄漏）
         e_i = e_i * mask_f
 
+        # 再过一个 token MLP，提升表达能力
+        e_i = self.embedding_mlp(e_i.reshape(B * K, -1)).reshape(B, K, -1)
+        e_i = e_i * mask_f
+
+        # 最后对 token 做一次 LN（再 mask 回 0）
+        e_i = self.token_ln(e_i) * mask_f
+
         # --------- 2) h_i: value ---------
-        h_i = self.neighbor_value_mlp(e_i.view(B * K, -1)).view(B, K, -1)           # [B,K,H]
+        h_i = self.neighbor_value_mlp(e_i.reshape(B * K, -1)).reshape(B, K, -1)  # [B,K,H]
         h_i = h_i * mask_f
 
         # --------- 3) e_m: 有效邻居均值 embedding ---------
@@ -151,7 +228,7 @@ class NeighborEncoder(nn.Module):
 
         # --------- 4) scores -> masked-softmax 权重 ---------
         att_in = torch.cat([e_i, e_m_repeat], dim=-1)                               # [B,K,2H]
-        scores = self.attention_mlp(att_in.view(B * K, -1)).view(B, K)              # [B,K]
+        scores = self.attention_mlp(att_in.reshape(B * K, -1)).reshape(B, K)        # [B,K]
 
         # 只对有效邻居做 softmax（M=0 时 weights 全 0）
         attn_weights = self._masked_softmax(scores, neighbor_mask, dim=1)           # [B,K]
@@ -180,15 +257,20 @@ class EnvEncoder(nn.Module):
     def __init__(
         self,
         self_obs_dim=4,
-        self_obs_embed_dim=128,
+        self_obs_embed_dim=64,
         neighbor_obs_dim=4,
         neighbor_hidden_size=128,
-        neighbor_base_channels=32,
+        neighbor_base_channels=64,
         obstacle_embedding_dim=128,
         n_head=4,
-        num_use_neighbor_obs=6,
-        env_output_feature=128,
+        num_use_neighbor_obs=3,
+        env_output_feature=256,
         dropout=0.1,
+        use_sdf_grad: bool = True,
+        sdf_grad_scale: float = 8.0,
+        sdf_grad_clip: float | None = 1.0,
+        use_ctx_ffn: bool = True,
+        use_neigh_self_attn: bool = True,
     ):
         super().__init__()
         assert n_head in (4, 8), "建议只用 n_head=4 或 8"
@@ -204,12 +286,14 @@ class EnvEncoder(nn.Module):
 
         self.obstacle_embedding_dim = obstacle_embedding_dim
         self.neighbor_base_channels = neighbor_base_channels
+        self.use_ctx_ffn = use_ctx_ffn
+        self.use_neigh_self_attn = use_neigh_self_attn
 
         # 1) self 编码
         self.embed_encoder = nn.Sequential(
-            nn.Linear(self_obs_dim, 64),
+            nn.Linear(self_obs_dim, self_obs_embed_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(64, self_obs_embed_dim),
+            nn.Linear(self_obs_embed_dim, self_obs_embed_dim),
         )
         self.self_ln = nn.LayerNorm(self_obs_embed_dim)
 
@@ -217,6 +301,9 @@ class EnvEncoder(nn.Module):
         self.obstacle_encoder = ObstacleEncoder(
             embedding_dim=obstacle_embedding_dim,
             base_channels=neighbor_base_channels,
+            use_sdf_grad=use_sdf_grad,
+            sdf_grad_scale=sdf_grad_scale,
+            sdf_grad_clip=sdf_grad_clip,
         )
         self.obs_global_ln = nn.LayerNorm(obstacle_embedding_dim)
 
@@ -247,6 +334,28 @@ class EnvEncoder(nn.Module):
             dropout=dropout,
         )
 
+        # 4.5) neighbor self-attention（让邻居先交流）
+        if self.use_neigh_self_attn:
+            self.neigh_self_attn = nn.MultiheadAttention(
+                embed_dim=neighbor_hidden_size,
+                num_heads=n_head,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.neigh_self_ln = nn.LayerNorm(neighbor_hidden_size)
+            self.neigh_self_alpha = nn.Parameter(torch.tensor(0.1))
+
+        # 4.6) ctx_tokens FFN 残差块（纯增量语义不变）
+        if self.use_ctx_ffn:
+            self.ctx_ffn = nn.Sequential(
+                nn.LayerNorm(neighbor_hidden_size),
+                nn.Linear(neighbor_hidden_size, 2 * neighbor_hidden_size),
+                nn.SiLU(),
+                nn.Linear(2 * neighbor_hidden_size, neighbor_hidden_size),
+                nn.Dropout(dropout),
+            )
+            self.ctx_alpha = nn.Parameter(torch.tensor(0.1))
+
         # 5) delta LN + 可学习缩放（你想永远保留增量也没问题，默认 1）
         self.delta_alpha = nn.Parameter(torch.tensor(1.0))
         self.delta_ln = nn.LayerNorm(neighbor_hidden_size)
@@ -260,11 +369,11 @@ class EnvEncoder(nn.Module):
         )
 
         self.fusion_mlp = nn.Sequential(
-            nn.Linear(fusion_in, 256),
+            nn.Linear(fusion_in, 2 * env_output_feature),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
+            nn.Linear(2 * env_output_feature, env_output_feature),
             nn.ReLU(inplace=True),
-            nn.Linear(128, env_output_feature),
+            nn.Linear(env_output_feature, env_output_feature),
         )
 
     def forward(self, self_obs, neighbor_obs, sdf_input, neighbor_mask):
@@ -280,8 +389,9 @@ class EnvEncoder(nn.Module):
         # 0) self_obs -> start + goal_rel
         start = self_obs[:, :self.half_dim]
         goal  = self_obs[:, self.half_dim:]
+        start_rel = start - start
         goal_rel = goal - start
-        self_obs_proc = torch.cat([start, goal_rel], dim=-1)
+        self_obs_proc = torch.cat([start_rel, goal_rel], dim=-1)
 
         # 1) self_feat
         self_feat = self.self_ln(self.embed_encoder(self_obs_proc))  # [B, Ds_emb]
@@ -308,17 +418,43 @@ class EnvEncoder(nn.Module):
         else:
             qmask_f = neighbor_mask.to(device=self_obs.device, dtype=neigh_tokens.dtype)
 
+        # 3.5) 邻居 self-attention（不改变 tokens 形状）
+        if self.use_neigh_self_attn:
+            pad_mask = None
+            if neighbor_mask is not None:
+                pad_mask = ~neighbor_mask  # True 表示 padding
+            attn_out, _ = self.neigh_self_attn(
+                neigh_tokens, neigh_tokens, neigh_tokens,
+                key_padding_mask=pad_mask,
+                need_weights=False,
+            )
+            # 如果整行都是 padding，强制置零避免 NaN
+            if neighbor_mask is not None:
+                valid = neighbor_mask.any(dim=1)
+                if not valid.all():
+                    attn_out = attn_out.clone()
+                    attn_out[~valid] = 0.0
+            neigh_tokens = neigh_tokens + self.neigh_self_alpha * attn_out
+            neigh_tokens = self.neigh_self_ln(neigh_tokens)
+            neigh_tokens = neigh_tokens * qmask_f.unsqueeze(-1)
+
         # 4) neighbor_tokens -> query obstacle_tokens
         # ✅ 取回纯 ctx（纯增量项）
-        _, attn, ctx_tokens = self.cross_attention(
+        _, _, ctx_tokens = self.cross_attention(
             query=neigh_tokens,          # [B,K,d_model]
             key=obs_tokens_proj,         # [B,M,d_model]
             value=obs_tokens_proj,       # [B,M,d_model]
             mask=None,
             return_ctx=True,
         )  # ctx_tokens: [B,K,d_model]
-        
+
+        # padding query 强制清零（否则 query=0 也会拿到均值 ctx）
         ctx_tokens = ctx_tokens * qmask_f.unsqueeze(-1)
+
+        # ctx_tokens FFN 残差（保持“纯增量”语义）
+        if self.use_ctx_ffn:
+            ctx_tokens = ctx_tokens + self.ctx_alpha * self.ctx_ffn(ctx_tokens)
+            ctx_tokens = ctx_tokens * qmask_f.unsqueeze(-1)
 
         # --- 5) 聚合 “障碍感知的增量修正” ---
         ctx_strength = ctx_tokens.norm(p=2, dim=-1)                      # [B, K]
@@ -327,99 +463,6 @@ class EnvEncoder(nn.Module):
 
         neigh_delta_global = (ctx_tokens * w_obst.unsqueeze(-1)).sum(dim=1)  # [B, d_model]
         neigh_delta_global = self.delta_ln(self.delta_alpha * neigh_delta_global)
-        
-        from utils.eval_attention import CrossAttnSDFVis, analyze_cross_attn_vs_sdf, analyze_attn_similarity,debug_query_attn_ctx_similarity, analyze_query_attn_ctx_invariance, debug_attn_entropy_and_logits
-        vis = CrossAttnSDFVis(sdf_scale=4.0, attn_alpha=0.55)
-    
-        # # 聚合 attention（并列SDF）
-        # vis.show_aggregated(
-        #     sdf_input=sdf_input,             # ✅ 直接传网络输入的SDF
-        #     attn_weights=attn,
-        #     neighbor_mask=neighbor_mask,     # 建议传
-        #     b=0,
-        #     agg="mean_valid",
-        #     extent=None,                     # 你说不要坐标的话就None
-        #     fname="logs/attn_agg_pair.png",
-        # )
-
-        # # 单邻居 attention（强烈建议逐个看）
-        # vis.show_single_neighbor(
-        #     sdf_input=sdf_input,
-        #     attn_weights=attn,
-        #     b=0,
-        #     k=2,
-        #     head=None,
-        #     extent=None,
-        #     fname="logs/attn_k2_pair.png",
-        # )
-
-        # vis.show_valid_neighbors_heads_grid(
-        #     sdf_input=sdf_input,
-        #     attn_weights=attn,
-        #     neighbor_mask=neighbor_mask,
-        #     b=0,
-        #     extent=None,
-        #     out_dir="logs",
-        #     prefix="attn_grid",
-        # )
-
-        # analyze_attn_similarity(
-        #     attn_weights=attn,                 # [B,H,K,M]
-        #     neigh_tokens=neigh_tokens,         # [B,K,d_model]
-        #     ctx_tokens=ctx_tokens,             # [B,K,d_model]
-        #     neighbor_mask=neighbor_mask,       # [B,K] bool
-        #     cross_attn_module=self.cross_attention,
-        #     b=0,
-        #     topk=30,
-        # )
-
-        # import time
-        # time.sleep(2)
-
-        # debug_query_attn_ctx_similarity(
-        #     neigh_tokens=neigh_tokens.detach(),
-        #     attn=attn.detach(),
-        #     ctx_tokens=ctx_tokens.detach(),
-        #     neighbor_mask=neighbor_mask,
-        #     b=0,
-        #     pair_mode="all_pairs",  # 或 "vs_first"
-        #     print_top=30,
-        # )
-
-        # analyze_query_attn_ctx_invariance(
-        #     cross_attn=self.cross_attention,
-        #     neigh_tokens=neigh_tokens,
-        #     obs_tokens_proj=obs_tokens_proj,
-        #     attn_weights=attn,
-        #     ctx_tokens=ctx_tokens,
-        #     neighbor_mask=neighbor_mask,
-        #     b=0,
-        # )
-
-        # debug_attn_entropy_and_logits(self.cross_attention, neigh_tokens, obs_tokens_proj, attn, neighbor_mask, b=0)
-
-
-        # # neigh_w 聚合
-        # analyze_cross_attn_vs_sdf(
-        #     sdf_input=sdf_input,
-        #     attn_weights=attn,
-        #     neighbor_mask=neighbor_mask,
-        #     neighbor_weights=neigh_w.detach(),
-        #     b=0,
-        # )
-
-        # # w_obst 聚合（更贴近你最终 delta 聚合逻辑）
-        # analyze_cross_attn_vs_sdf(
-        #     sdf_input=sdf_input,
-        #     attn_weights=attn,
-        #     neighbor_mask=neighbor_mask,
-        #     neighbor_weights=w_obst.detach(),
-        #     b=0,
-        # )
-        # print('tokens', neigh_tokens)
-        # print('weight', attn)
-        # debug_projected_q_cos(self.cross_attention, neigh_tokens, neighbor_mask, b=0, k0=0, k1=1)
-        # debug_value_token_diversity(obs_tokens_proj, b=0)
 
         # 6) 4 路融合
         fused = torch.cat(
@@ -528,15 +571,15 @@ class LateFusionHead(nn.Module):
             self.z_ln = nn.LayerNorm(z_dim)
             self.c_ln = nn.LayerNorm(c_dim)
             self.post = nn.Sequential(
-                nn.Linear(z_dim + c_dim, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
-                nn.Linear(512, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True),
+                nn.Linear(z_dim + c_dim, 2 * out_dim), nn.LayerNorm(2 * out_dim), nn.ReLU(inplace=True),
+                nn.Linear(2 * out_dim, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True),
                 nn.Linear(out_dim, out_dim)
             )
 
         else:  # concat
             self.post = nn.Sequential(
-                nn.Linear(z_dim + c_dim, 512), nn.LayerNorm(512), nn.ReLU(inplace=True),
-                nn.Linear(512, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True),
+                nn.Linear(z_dim + c_dim, 2 * out_dim), nn.LayerNorm(2 * out_dim), nn.ReLU(inplace=True),
+                nn.Linear(2 * out_dim, out_dim), nn.LayerNorm(out_dim), nn.ReLU(inplace=True),
                 nn.Linear(out_dim, out_dim)
             )
 
@@ -575,15 +618,21 @@ class RLFields(nn.Module):
     def __init__(
         self, 
         self_obs_dim: int = 4,
-        self_obs_embed_dim: int = 128, 
+        self_obs_embed_dim: int = 64, 
         neighbor_obs_dim: int = 4, 
         neighbor_hidden_size: int = 128, 
-        neighbor_base_channels: int = 32,
+        neighbor_base_channels: int = 64,
         obstacle_embedding_dim: int = 128, 
         n_head: int = 4, 
-        num_use_neighbor_obs: int = 6,
-        env_output_feature: int = 128,
+        num_use_neighbor_obs: int = 3,
+        env_output_feature: int = 256,
         fusion_mode: str = "film",
+        # -------- SDF/Attention 增强 --------
+        use_sdf_grad: bool = True,
+        sdf_grad_scale: float = 8.0,
+        sdf_grad_clip: float | None = 1.0,
+        use_ctx_ffn: bool = True,
+        use_neigh_self_attn: bool = True,
         # -------- NTFields 配置 --------
         nt_dim: int = 2,
         nt_vmax: float = 1.0,
@@ -609,6 +658,11 @@ class RLFields(nn.Module):
         self.num_use_neighbor_obs = num_use_neighbor_obs
         self.env_output_feature = env_output_feature
         self.fusion_mode = fusion_mode
+        self.use_sdf_grad = use_sdf_grad
+        self.sdf_grad_scale = sdf_grad_scale
+        self.sdf_grad_clip = sdf_grad_clip
+        self.use_ctx_ffn = use_ctx_ffn
+        self.use_neigh_self_attn = use_neigh_self_attn
 
         # NTFields config
         self.nt_dim = nt_dim
@@ -633,7 +687,12 @@ class RLFields(nn.Module):
             obstacle_embedding_dim=self.obstacle_embedding_dim,
             n_head=self.n_head,
             num_use_neighbor_obs=self.num_use_neighbor_obs,
-            env_output_feature=self.env_output_feature
+            env_output_feature=self.env_output_feature,
+            use_sdf_grad=self.use_sdf_grad,
+            sdf_grad_scale=self.sdf_grad_scale,
+            sdf_grad_clip=self.sdf_grad_clip,
+            use_ctx_ffn=self.use_ctx_ffn,
+            use_neigh_self_attn=self.use_neigh_self_attn,
         )
 
         # -------- NTFields 主干 --------
@@ -667,11 +726,17 @@ class RLFields(nn.Module):
             p.requires_grad_(False)
         self.ntfields_nn.eval()    # 里面如果有 BN/Dropout，就固定住
 
+        self.ntfields_feat_proj = nn.Sequential(
+            nn.Linear(self.nt_feat_dim, self.env_output_feature),
+            nn.ReLU(),
+            nn.Linear(self.env_output_feature, self.env_output_feature),
+        )
+
         # 门控fuser
         self.late_fusion = LateFusionHead(
             z_dim=self.env_output_feature,
-            c_dim=self.nt_feat_dim,
-            out_dim=self.nt_feat_dim,
+            c_dim=self.env_output_feature,
+            out_dim=self.env_output_feature,
             mode=self.fusion_mode
         )
     
@@ -718,6 +783,7 @@ class RLFields(nn.Module):
 
         # -------- 5) NTFields 特征（用 self_obs 作为 coords） --------
         nt_feat, _ = self.ntfields_nn.out_feature(self_obs)      # [B, nt_feat_dim]
+        nt_feat = self.ntfields_feat_proj(nt_feat)
 
         # -------- 6) LateFusionHead 门控融合 --------
         fused_feat = self.late_fusion(env_embedding, nt_feat)    # [B, nt_feat_dim]
@@ -1041,99 +1107,3 @@ class NN(nn.Module):
         """
         output, coords = self.out(coords)
         return output, coords
-    
-if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # ==== 配置，需和 RLFields 里保持一致 ====
-    self_obs_dim = 4              # [start(2), goal(2)]
-    neighbor_obs_dim = 4
-    num_use_neighbor_obs = 6
-    H = 80                        # SDF 分辨率 HxH，这里用 80x80
-
-    # nt_dim 要和 self_obs_dim 对应：self_obs_dim == 2 * nt_dim
-    nt_dim = 2
-
-    # ==== 构建模型 ====
-    model = RLFields(
-        self_obs_dim=self_obs_dim,
-        self_obs_embed_dim=128,
-        neighbor_obs_dim=neighbor_obs_dim,
-        neighbor_hidden_size=128,
-        neighbor_base_channels=32,
-        obstacle_embedding_dim=128,
-        n_head=6,
-        num_use_neighbor_obs=num_use_neighbor_obs,
-        env_output_feature=128,
-        fusion_mode="film",
-        nt_dim=nt_dim,
-        nt_vmax=1.0,
-        nt_h_size=256,
-        nt_enc_d=7,
-        nt_dec_d=7,
-        nt_full_coords_enc=False,
-        nt_basic_block="resnet",
-        nt_use_unet=False,
-        nt_symm_op_type="min_max",
-        device=str(device),
-    ).to(device)
-
-    model.train()
-
-    # ==== 构造假输入 ====
-    batch_size = 3
-
-    neigh_flat_dim = num_use_neighbor_obs * neighbor_obs_dim
-    sdf_flat_dim = H * H
-    obs_dim_total = self_obs_dim + neigh_flat_dim + 1 + sdf_flat_dim
-
-    # 全部先置零
-    observations = torch.zeros(batch_size, obs_dim_total, device=device)
-
-    # 1) self_obs: [start, goal]
-    # 这里随便造一点在 [-1, 1] 的值
-    offset = 0
-    observations[:, offset: offset + self_obs_dim] = (
-        torch.rand(batch_size, self_obs_dim, device=device) * 2.0 - 1.0
-    )
-    offset += self_obs_dim
-
-    # 2) neighbor_obs_flat: [B, K * neighbor_obs_dim]
-    observations[:, offset: offset + neigh_flat_dim] = torch.randn(
-        batch_size, neigh_flat_dim, device=device
-    )
-    offset += neigh_flat_dim
-
-    # 3) neighbor_valid_num: [B]，0~K 之间的整数
-    neighbor_valid_num = torch.randint(
-        low=0,
-        high=num_use_neighbor_obs + 1,
-        size=(batch_size,),
-        device=device,
-    ).float()
-    observations[:, offset] = neighbor_valid_num
-    offset += 1
-
-    # 4) sdf_flat: [B, H*H]，在 [0,1] 范围
-    observations[:, offset:] = torch.rand(
-        batch_size, sdf_flat_dim, device=device
-    )
-
-    observations.requires_grad_(True)
-
-    # ==== 前向 ====
-    tau = model(observations)
-    print("tau shape:", tau.shape)
-    print("tau:", tau)
-
-    # ==== 反向，看下梯度是否能正常传播 ====
-    loss = tau.mean()
-    loss.backward()
-
-    # 打印一部分 grad 确认不是 None
-    print("observations.grad[0, :10]:", observations.grad[0, :10])
-
-    total_grad_norm = 0.0
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            total_grad_norm += p.grad.norm().item()
-    print("total grad norm over parameters:", total_grad_norm)

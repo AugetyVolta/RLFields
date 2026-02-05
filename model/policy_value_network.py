@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 
-from .models_new import RLFields
+from .models import RLFields
 
 class RLFieldsActorModel(TorchModelV2, nn.Module):
     """
@@ -44,15 +44,20 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         # ==== 构造 RLFields ====
         self.rlfields = RLFields(
             self_obs_dim=cfg.get("self_obs_dim", 4),
-            self_obs_embed_dim=cfg.get("self_obs_embed_dim", 128),
+            self_obs_embed_dim=cfg.get("self_obs_embed_dim", 64),
             neighbor_obs_dim=cfg.get("neighbor_obs_dim", 4),
             neighbor_hidden_size=cfg.get("neighbor_hidden_size", 128),
-            neighbor_base_channels=cfg.get("neighbor_base_channels", 32),
+            neighbor_base_channels=cfg.get("neighbor_base_channels", 64),
             obstacle_embedding_dim=cfg.get("obstacle_embedding_dim", 128),
             n_head=cfg.get("n_head", 4),
-            num_use_neighbor_obs=cfg.get("num_use_neighbor_obs", 6),
-            env_output_feature=cfg.get("env_output_feature", 128),
+            num_use_neighbor_obs=cfg.get("num_use_neighbor_obs", 3),
+            env_output_feature=cfg.get("env_output_feature", 256),
             fusion_mode=cfg.get("fusion_mode", "film"),
+            use_sdf_grad=cfg.get("use_sdf_grad", True),
+            sdf_grad_scale=cfg.get("sdf_grad_scale", 1.0),
+            sdf_grad_clip=cfg.get("sdf_grad_clip", 1.0),
+            use_ctx_ffn=cfg.get("use_ctx_ffn", True),
+            use_neigh_self_attn=cfg.get("use_neigh_self_attn", True),
             nt_dim=cfg.get("nt_dim", 2),
             nt_vmax=cfg.get("nt_vmax", 1.0),
             nt_h_size=cfg.get("nt_h_size", 256),
@@ -67,7 +72,7 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         )
 
         # fused_feat 特征维度 = RLFields 里 fused_feat 的维度
-        self.fused_feat_dim = self.rlfields.nt_feat_dim
+        self.fused_feat_dim = self.rlfields.env_output_feature
         self.nt_dim = self.rlfields.nt_dim  # 一般是 2，对应 prior_dir 的维度
 
         # ==== 先验 embedding 分支 ====
@@ -77,7 +82,6 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
             nn.Linear(self.nt_dim, self.prior_embed_dim),
             nn.SiLU(),
             nn.Linear(self.prior_embed_dim, self.prior_embed_dim),
-            nn.SiLU(),
         )
 
         # ==== 残差头：输入 = fused_feat + prior_feat ====
@@ -87,9 +91,9 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         self.delta_head = nn.Sequential(
             nn.Linear(delta_input_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(128, self.action_dim),
+            nn.Linear(256, self.action_dim),
             nn.Tanh(),  # 输出动作 α/θ ∈ [-1, 1]
         )
 
@@ -110,7 +114,7 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         # ==== 价值函数部分 ====
         self.value_head = nn.Sequential(
             nn.Linear(self.fused_feat_dim, 256),
-            nn.ReLU(), 
+            nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
             nn.Linear(256, 1),
