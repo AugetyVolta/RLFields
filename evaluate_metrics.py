@@ -86,6 +86,9 @@ def evaluate(
     agg_agent_success_rate = []
     agg_team_path = []
     agg_team_return = []
+    agg_team_avg_speed = []
+    agg_team_steps_mean = []
+    agg_team_steps_max = []
     agg_team_comp = defaultdict(list)  # k -> [ep_sum_k]
 
     for ep in range(episodes):
@@ -105,6 +108,7 @@ def evaluate(
         agent_timeout = defaultdict(bool)
         agent_collision = defaultdict(bool)
         agent_steps = defaultdict(int)
+        agent_speed_sum = defaultdict(float)
 
         # path: store last position for each seen agent
         last_pos = {aid: _robot_pos(env, aid) for aid in obs.keys()}
@@ -159,6 +163,10 @@ def evaluate(
                         continue
                     agent_comp[agent_id][k] += v
 
+                # speed: 统计每步速度（如果 info 没有就跳过）
+                if "speed" in info and isinstance(info["speed"], (int, float, np.number)):
+                    agent_speed_sum[agent_id] += float(info["speed"])
+
                 # success / failure flags
                 if info.get("r_arrive", 0.0) > 0.0:
                     agent_arrived[agent_id] = True
@@ -175,6 +183,9 @@ def evaluate(
         team_comp_sum = defaultdict(float)
         team_path = 0.0
         team_return = 0.0
+        team_steps_sum = 0.0
+        team_steps_max = 0.0
+        team_speed_sum = 0.0
 
         for aid in agents:
             comp = dict(agent_comp[aid])
@@ -183,24 +194,32 @@ def evaluate(
             arrived = bool(agent_arrived.get(aid, False))
             timeout = bool(agent_timeout.get(aid, False))
             collision = bool(agent_collision.get(aid, False))
+            steps = int(agent_steps.get(aid, 0))
+            avg_speed = float(agent_speed_sum.get(aid, 0.0) / max(steps, 1))
 
             per_agent[aid] = {
                 "arrived": arrived,
                 "timeout": timeout,
                 "collision": collision,
-                "steps": int(agent_steps.get(aid, 0)),
+                "steps": steps,
                 "path_len": path,
                 "return": ret,
+                "avg_speed": avg_speed,
                 "reward_components": comp,
             }
 
             team_path += path
             team_return += ret
+            team_steps_sum += steps
+            team_steps_max = max(team_steps_max, steps)
+            team_speed_sum += agent_speed_sum.get(aid, 0.0)
             for k, v in comp.items():
                 team_comp_sum[k] += float(v)
 
         agent_success_rate = float(np.mean([1.0 if per_agent[aid]["arrived"] else 0.0 for aid in agents])) if agents else 0.0
         team_success = bool(all(per_agent[aid]["arrived"] for aid in agents)) if agents else False
+        team_steps_mean_per_agent = float(team_steps_sum / n_agents)
+        team_avg_speed = float(team_speed_sum / max(team_steps_sum, 1.0))
 
         ep_summary = {
             "ep": ep,
@@ -209,6 +228,9 @@ def evaluate(
             "team_path_len": float(team_path),
             "team_path_mean_per_agent": float(team_path / n_agents),
             "team_return": float(team_return),
+            "team_avg_speed": team_avg_speed,
+            "team_steps_mean_per_agent": team_steps_mean_per_agent,
+            "team_steps_max": float(team_steps_max),
             "team_reward_components_sum": dict(team_comp_sum),
             "per_agent": per_agent,
         }
@@ -219,6 +241,9 @@ def evaluate(
         agg_agent_success_rate.append(agent_success_rate)
         agg_team_path.append(float(team_path))
         agg_team_return.append(float(team_return))
+        agg_team_avg_speed.append(float(team_avg_speed))
+        agg_team_steps_mean.append(float(team_steps_mean_per_agent))
+        agg_team_steps_max.append(float(team_steps_max))
         for k, v in team_comp_sum.items():
             agg_team_comp[k].append(float(v))
 
@@ -242,6 +267,9 @@ def evaluate(
         "agent_success_rate_mean": _mean_std(agg_agent_success_rate)[0],
         "team_path_len_mean": _mean_std(agg_team_path)[0],
         "team_return_mean": _mean_std(agg_team_return)[0],
+        "team_avg_speed_mean": _mean_std(agg_team_avg_speed)[0],
+        "team_steps_mean_per_agent_mean": _mean_std(agg_team_steps_mean)[0],
+        "team_steps_max_mean": _mean_std(agg_team_steps_max)[0],
         "team_reward_components_mean": {k: _mean_std(vs)[0] for k, vs in agg_team_comp.items()},
         "team_reward_components_std": {k: _mean_std(vs)[1] for k, vs in agg_team_comp.items()},
     }

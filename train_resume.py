@@ -137,3 +137,5 @@ if __name__ == "__main__":
     final_root = os.path.join(exp_info["ckpt_dir"], "final")
     final_ckpt = algo.save(final_root)
     print(f"Final checkpoint saved at {final_ckpt}")
+
+    ray.shutdown()

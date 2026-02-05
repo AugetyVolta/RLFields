@@ -118,7 +118,7 @@ if __name__ == "__main__":
     cfg = SceneConfig()
     algo, exp_info = prepare_exp(cfg)
 
-    for it in range(60):
+    for it in range(cfg.experiment_params.max_iters):
         result = algo.train()
         print(f"[{exp_info['exp_name']}] iter={it}", result)   
 
@@ -130,3 +130,5 @@ if __name__ == "__main__":
     final_root = os.path.join(exp_info["ckpt_dir"], "final")
     final_ckpt = algo.save(final_root)
     print(f"Final checkpoint saved at {final_ckpt}")
+
+    ray.shutdown()
