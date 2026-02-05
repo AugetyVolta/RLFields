@@ -1,0 +1,9 @@
+model copy是最初版的model，里面对于film的初始化不对，导致梯度没法回传
+model copy2是修改了对于film的初始化，增加更多的特征融合方式
+models是修改attention后最初版没有pos embedding的代码
+models_pe是初版有pos embedding的代码，但是效果不好
+models_new是修改models_no_pe存在的neighbor token在query 投影后相似的问题
+models_new_new是在models_new的基础上增加了一些维度，使得维度更规范
+models_new_new_new是增加了有关neighbor token的self attention，对于sdf处理增加了梯度信息，对于ctx_token使用了FFN，并且针对models_new_new可关闭新增代码部分
+
+policy_value_network * 是根据不同model修改的，更改了一些维度
