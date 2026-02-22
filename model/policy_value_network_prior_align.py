@@ -7,8 +7,17 @@ from .models_prior_align import RLFieldsPriorAlign
 
 class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
     """
-    PPO 的 actor-critic 模型封装（prior-aligned 版本）。
+    PPO 的 actor-critic 模型封装：
+    - RLFields(obs_trunk) -> (fused_feat, prior_dir)
+        fused_feat: 融合了 NTFields + 环境/邻居 的高维特征 [B, nt_feat_dim]
+        prior_dir:  归一化后的先验方向 [B, nt_dim]（由 RLFields 直接返回）
+    - 策略：动作直接输出 (alpha, theta)，范围都在 [-1, 1]。
+      其中 alpha 后续在 env 中映射到 [0,1] 并乘 v_max 作为速度幅度；
+      theta 后续在 env 中映射到 [-pi,pi] 并以 prior direction 作为基准旋转。
+      然后拼接 log_std 形成 logits。
+    - 价值函数：用 fused_feat 做 value_head。
     """
+
     def __init__(
         self,
         obs_space,
@@ -21,7 +30,10 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
         nn.Module.__init__(self)
 
+        # 动作维度，例如 Box(shape=(2,))
         self.action_dim = action_space.shape[0]
+
+        # RLlib 的 Gaussian 分布：num_outputs 应该 = 2 * action_dim（mean + log_std）
         assert num_outputs == 2 * self.action_dim, \
             f"num_outputs={num_outputs} 和 action_dim={self.action_dim} 不匹配"
 
@@ -29,6 +41,7 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
         cfg.update(model_config.get("custom_model_config", {}))
         cfg.update(custom_model_kwargs)
 
+        # ==== 构造 RLFieldsPriorAlign ====
         self.rlfields = RLFieldsPriorAlign(
             self_obs_dim=cfg.get("self_obs_dim", 4),
             self_obs_embed_dim=cfg.get("self_obs_embed_dim", 64),
@@ -41,7 +54,7 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
             env_output_feature=cfg.get("env_output_feature", 256),
             fusion_mode=cfg.get("fusion_mode", "film"),
             use_sdf_grad=cfg.get("use_sdf_grad", True),
-            sdf_grad_scale=cfg.get("sdf_grad_scale", 1.0),
+            sdf_grad_scale=cfg.get("sdf_grad_scale", 8.0),
             sdf_grad_clip=cfg.get("sdf_grad_clip", 1.0),
             use_ctx_ffn=cfg.get("use_ctx_ffn", True),
             use_neigh_self_attn=cfg.get("use_neigh_self_attn", True),
@@ -58,7 +71,7 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
             device=cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"),
         )
 
-                # fused_feat 特征维度 = RLFields 里 fused_feat 的维度
+        # fused_feat 特征维度 = RLFields 里 fused_feat 的维度
         self.fused_feat_dim = self.rlfields.env_output_feature
         self.nt_dim = self.rlfields.nt_dim  # 一般是 2，对应 prior_dir 的维度
 
@@ -70,6 +83,9 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
             nn.SiLU(),
             nn.Linear(self.prior_embed_dim, self.prior_embed_dim),
         )
+        # 对齐两路特征的尺度，稳定融合
+        self.fused_ln = nn.LayerNorm(self.fused_feat_dim)
+        self.prior_ln = nn.LayerNorm(self.prior_embed_dim)
 
         # ==== 残差头：输入 = fused_feat + prior_feat ====
         delta_input_dim = self.fused_feat_dim + self.prior_embed_dim
@@ -126,6 +142,8 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
         prior_feat = self.prior_mlp(prior_dir)  # [B, prior_embed_dim]
 
         # ===== policy head 输入：环境特征 + 先验 embedding =====
+        fused_feat = self.fused_ln(fused_feat)
+        prior_feat = self.prior_ln(prior_feat)
         delta_in = torch.cat([fused_feat, prior_feat], dim=-1)  # [B, T + prior_embed_dim]
 
         # 输出动作: [alpha_raw, theta_raw]，都在 [-1, 1]
@@ -139,6 +157,7 @@ class RLFieldsActorModelPriorAlign(TorchModelV2, nn.Module):
         return logits, state
 
     def value_function(self):
+        # 用 fused_feat 做 value
         assert self._last_fused_feat is not None, "must call forward() before value_function()"
-        v = self.value_head(self._last_fused_feat)
+        v = self.value_head(self._last_fused_feat)                    # [B,1]
         return v.squeeze(-1)

@@ -67,7 +67,7 @@ class RLFieldsConfig:
     fusion_mode: str = "concat_ln"
     # -------- SDF/Attention 增强 --------
     use_sdf_grad: bool = True
-    sdf_grad_scale: float = 1.0
+    sdf_grad_scale: float = 8.0
     sdf_grad_clip: float | None = 1.0
     use_ctx_ffn: bool = True
     use_neigh_self_attn: bool = True
