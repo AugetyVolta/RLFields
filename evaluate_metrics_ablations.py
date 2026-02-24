@@ -17,6 +17,8 @@ from model.policy_value_network_prior_align import RLFieldsActorModelPriorAlign
 from env.multi_robot_env_reward_ablations import (
     MultiRobotEnv_PriorAlign_NoPriorAlignReward,
     MultiRobotEnv_ActionDirect_PriorAlign_NoPriorAlignReward,
+    MultiRobotEnv_PriorAlign_NoPeerPotentialReward,
+    MultiRobotEnv_PriorAlign_PeerNearestReward,
 )
 from model.policy_value_network_ablations import (
     RLFieldsActorModel_NoPCFeaturesPriorAlign,
@@ -55,6 +57,16 @@ def build_ppo_config_multiagent(cfg: SceneConfig, ablation: str) -> PPOConfig:
         env_cls = MultiRobotEnv_PriorAlign_NoPriorAlignReward
         model_cls = RLFieldsActorModelPriorAlign
         model_name = "rlfields_actor_prior_r0_eval"
+    elif ablation == "r_no_peer":
+        # reward-only: 去掉邻居势场项
+        env_cls = MultiRobotEnv_PriorAlign_NoPeerPotentialReward
+        model_cls = RLFieldsActorModelPriorAlign
+        model_name = "rlfields_actor_prior_r_no_peer_eval"
+    elif ablation == "r_peer_nearest":
+        # reward-only: 邻居势场聚合改为最近邻
+        env_cls = MultiRobotEnv_PriorAlign_PeerNearestReward
+        model_cls = RLFieldsActorModelPriorAlign
+        model_name = "rlfields_actor_prior_r_peer_nearest_eval"
     else:
         raise ValueError(f"Unknown ablation: {ablation}")
 
@@ -100,7 +112,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="RLlib checkpoint dir (algo.restore expects this path)")
     parser.add_argument("--ablation", type=str, default="orig",
-                        choices=["orig", "ab1", "ab2", "ab3", "r0"],
+                        choices=["orig", "ab1", "ab2", "ab3", "r0", "r_no_peer", "r_peer_nearest"],
                         help="选择与你 checkpoint 对应的实验设置")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--max_steps", type=int, default=5000)

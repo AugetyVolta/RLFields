@@ -19,6 +19,8 @@ from model.policy_value_network_prior_align import RLFieldsActorModelPriorAlign
 from env.multi_robot_env_reward_ablations import (
     MultiRobotEnv_PriorAlign_NoPriorAlignReward,
     MultiRobotEnv_ActionDirect_PriorAlign_NoPriorAlignReward,
+    MultiRobotEnv_PriorAlign_NoPeerPotentialReward,
+    MultiRobotEnv_PriorAlign_PeerNearestReward,
 )
 from model.policy_value_network_ablations import (
     RLFieldsActorModel_NoPCFeaturesPriorAlign,
@@ -61,6 +63,14 @@ def _choose_env_model(ablation: str):
         env_cls = MultiRobotEnv_PriorAlign_NoPriorAlignReward
         model_cls = RLFieldsActorModelPriorAlign
         model_name = "rlfields_actor_prior_r0_no_prior_align_reward"
+    elif ablation == "r_no_peer":
+        env_cls = MultiRobotEnv_PriorAlign_NoPeerPotentialReward
+        model_cls = RLFieldsActorModelPriorAlign
+        model_name = "rlfields_actor_prior_r_no_peer"
+    elif ablation == "r_peer_nearest":
+        env_cls = MultiRobotEnv_PriorAlign_PeerNearestReward
+        model_cls = RLFieldsActorModelPriorAlign
+        model_name = "rlfields_actor_prior_r_peer_nearest"
     else:
         raise ValueError(f"unknown ablation: {ablation}")
     return env_cls, model_cls, model_name
@@ -169,7 +179,12 @@ def prepare_exp(cfg: SceneConfig, ablation: str, resume_exp_name: str | None = N
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ablation", type=str, required=True, choices=["orig", "ab1", "ab2", "ab3", "r0"])
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        required=True,
+        choices=["orig", "ab1", "ab2", "ab3", "r0", "r_no_peer", "r_peer_nearest"],
+    )
     parser.add_argument("--restore_ckpt_path", type=str, required=True, help="例如 logs/xxx/ckpts/iter_000019")
     parser.add_argument("--resume_exp_name", type=str, default=None, help="继续写回哪个实验目录名；不填则新建一个")
     parser.add_argument("--resume_it", type=int, default=None, help="起始迭代号；不填则尝试从路径自动解析")
