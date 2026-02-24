@@ -1,8 +1,11 @@
 from .marl_sim_env import MARL_SIM
 
 
-class MARL_SIM_NoPriorAlign(MARL_SIM):
-    """Reward ablation：关闭先验方向对齐项 (w_prior_align)，其余 reward 完全不变。"""
+class MARL_SIM_PriorAlign_NoPriorAlignReward(MARL_SIM):
+    """
+    no-prior-align 观测版本的 reward-only 消融：
+    仅关闭 w_prior_align，其他奖励项与 MARL_SIM 完全一致。
+    """
 
     def _calculate_reward(
         self,

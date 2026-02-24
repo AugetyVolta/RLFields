@@ -2,12 +2,16 @@ import numpy as np
 from gymnasium.spaces import Box
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
-from .sim.marl_sim_env_no_prior_align import MARL_SIM_NoPriorAlign
-from .sim.marl_sim_env_action_direct_no_prior_align import MARL_SIM_ActionDirect_NoPriorAlign
+from .sim.marl_sim_env_prior_align_no_prior_align import (
+    MARL_SIM_PriorAlign_NoPriorAlignReward,
+)
+from .sim.marl_sim_env_action_direct_prior_align_no_prior_align import (
+    MARL_SIM_ActionDirect_PriorAlign_NoPriorAlignReward,
+)
 
 
-class MultiRobotEnv_NoPriorAlign(MultiAgentEnv):
-    """Reward-only 消融：仅去掉 w_prior_align，其余与原始 env 一致。"""
+class MultiRobotEnv_PriorAlign_NoPriorAlignReward(MultiAgentEnv):
+    """不做 prior 旋转的 reward-only 消融：仅去掉 w_prior_align。"""
 
     def __init__(self, config):
         super().__init__()
@@ -27,7 +31,10 @@ class MultiRobotEnv_NoPriorAlign(MultiAgentEnv):
 
         self.agents = self.possible_agents = [f'robot_{i}' for i in range(self.num_robots)]
 
-        self.sim = MARL_SIM_NoPriorAlign(self.env_yaml_path, disable_plotting=self.disable_plotting)
+        self.sim = MARL_SIM_PriorAlign_NoPriorAlignReward(
+            self.env_yaml_path,
+            disable_plotting=self.disable_plotting,
+        )
 
     def get_observation_space(self, agent_id):
         if agent_id.startswith("robot_"):
@@ -48,8 +55,8 @@ class MultiRobotEnv_NoPriorAlign(MultiAgentEnv):
         return obs, rewards, terminateds, truncateds, infos
 
 
-class MultiRobotEnv_ActionDirect_NoPriorAlign(MultiAgentEnv):
-    """Ablation-1/3 推荐用：动作 direct + 去掉 w_prior_align。"""
+class MultiRobotEnv_ActionDirect_PriorAlign_NoPriorAlignReward(MultiAgentEnv):
+    """不做 prior 旋转的 ab1/ab3 环境：动作 direct + 去掉 w_prior_align。"""
 
     def __init__(self, config):
         super().__init__()
@@ -69,7 +76,10 @@ class MultiRobotEnv_ActionDirect_NoPriorAlign(MultiAgentEnv):
 
         self.agents = self.possible_agents = [f'robot_{i}' for i in range(self.num_robots)]
 
-        self.sim = MARL_SIM_ActionDirect_NoPriorAlign(self.env_yaml_path, disable_plotting=self.disable_plotting)
+        self.sim = MARL_SIM_ActionDirect_PriorAlign_NoPriorAlignReward(
+            self.env_yaml_path,
+            disable_plotting=self.disable_plotting,
+        )
 
     def get_observation_space(self, agent_id):
         if agent_id.startswith("robot_"):

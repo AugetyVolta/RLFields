@@ -10,16 +10,20 @@ from ray.tune.logger import UnifiedLogger
 
 from env.params import SceneConfig
 
-# 原始 env / model
-from env.multi_robot_env import MultiRobotEnv
-from model.policy_value_network import RLFieldsActorModel
+# 最终版基线 env / model（prior-align）
+from env.multi_robot_env_prior_align import MultiRobotEnvPriorAlign
+from model.policy_value_network_prior_align import RLFieldsActorModelPriorAlign
 
-# Ablation env / model
+# Ablation env / model（prior-align 基线上的消融）
 from env.multi_robot_env_reward_ablations import (
-    MultiRobotEnv_NoPriorAlign,
-    MultiRobotEnv_ActionDirect_NoPriorAlign,
+    MultiRobotEnv_PriorAlign_NoPriorAlignReward,
+    MultiRobotEnv_ActionDirect_PriorAlign_NoPriorAlignReward,
 )
-from model.policy_value_network_ablations import RLFieldsActorModel_NoPCFeatures
+from model.policy_value_network_ablations import (
+    RLFieldsActorModel_NoPCFeaturesPriorAlign,
+    RLFieldsActorModel_NoPriorDir,
+    RLFieldsActorModel_NoPCFeaturesNoPriorDir,
+)
 
 
 def get_experiment_name(prefix: str) -> str:
@@ -36,29 +40,30 @@ def make_logger_creator(logdir: str):
 def build_ppo_config_multiagent(cfg: SceneConfig, ablation: str):
     # --- choose env/model ---
     if ablation == "orig":
-        env_cls = MultiRobotEnv
-        model_cls = RLFieldsActorModel
-        model_name = "rlfields_actor_orig"
+        # 最终版 full model（SDF/neighbor + prior-align）
+        env_cls = MultiRobotEnvPriorAlign
+        model_cls = RLFieldsActorModelPriorAlign
+        model_name = "rlfields_actor_prior_full"
 
-    elif ablation == "ab1":  # direct action + remove prior-align reward
-        env_cls = MultiRobotEnv_ActionDirect_NoPriorAlign
-        model_cls = RLFieldsActorModel
-        model_name = "rlfields_actor_ab1_action_direct"
+    elif ablation == "ab1":  # direct action + remove prior-align reward + no prior rotation
+        env_cls = MultiRobotEnv_ActionDirect_PriorAlign_NoPriorAlignReward
+        model_cls = RLFieldsActorModel_NoPriorDir
+        model_name = "rlfields_actor_ab1_noprior"
 
-    elif ablation == "ab2":  # no PC-planner features (but keep prior-dir modulation & reward)
-        env_cls = MultiRobotEnv
-        model_cls = RLFieldsActorModel_NoPCFeatures
-        model_name = "rlfields_actor_ab2_nopc_feat"
+    elif ablation == "ab2":  # no PC-planner features (prior-align trunk 保留)
+        env_cls = MultiRobotEnvPriorAlign
+        model_cls = RLFieldsActorModel_NoPCFeaturesPriorAlign
+        model_name = "rlfields_actor_prior_ab2_nopc_feat"
 
-    elif ablation == "ab3":  # ab1 + ab2
-        env_cls = MultiRobotEnv_ActionDirect_NoPriorAlign
-        model_cls = RLFieldsActorModel_NoPCFeatures
-        model_name = "rlfields_actor_ab3_action_direct_nopc_feat"
+    elif ablation == "ab3":  # ab1 + ab2 (其中 ab1 部分不做 prior 旋转)
+        env_cls = MultiRobotEnv_ActionDirect_PriorAlign_NoPriorAlignReward
+        model_cls = RLFieldsActorModel_NoPCFeaturesNoPriorDir
+        model_name = "rlfields_actor_ab3_noprior_nopc"
 
-    elif ablation == "r0":   # reward-only: remove prior-align reward
-        env_cls = MultiRobotEnv_NoPriorAlign
-        model_cls = RLFieldsActorModel
-        model_name = "rlfields_actor_r0_no_prior_align"
+    elif ablation == "r0":   # reward-only: remove prior-align reward + no prior rotation
+        env_cls = MultiRobotEnv_PriorAlign_NoPriorAlignReward
+        model_cls = RLFieldsActorModelPriorAlign
+        model_name = "rlfields_actor_prior_r0_no_prior_align_reward"
 
     else:
         raise ValueError(f"unknown ablation: {ablation}")
