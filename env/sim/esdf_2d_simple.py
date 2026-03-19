@@ -35,42 +35,43 @@ class ESDF_2d:
         self.grid_range = (cfg.x_min, cfg.x_max, cfg.y_min, cfg.y_max)
         self.r_max = cfg.r_max
         self.sdf_grid = None  # 用于存储生成的SDF网格
-
+    
     def generate_sdf_from_pointcloud(self, pointcloud):
-        """
-        将点云转换为SDF（Signed Distance Field）。
-
-        参数：
-            pointcloud: Nx2的点云数组，N为点的个数。
-
-        返回：
-            SDF网格
-        """
         # 网格范围
         x_min, x_max, y_min, y_max = self.grid_range[0], self.grid_range[1], self.grid_range[2], self.grid_range[3]
-        
-        # 生成网格坐标
-        x_grid, y_grid = np.meshgrid(np.arange(x_min, x_max, self.grid_size), 
-                                     np.arange(y_min, y_max, self.grid_size))
-        
-        # 筛选距离小于r_max的点
-        valid = (np.linalg.norm(pointcloud, axis=1) <= self.r_max)
-        pointcloud = pointcloud[valid]
-        
-        # 将网格坐标展平并堆叠
-        grid_points = np.vstack([x_grid.ravel(), y_grid.ravel()]).T
-        
-        # 计算每个网格点到点云中所有点的距离
-        distances = cdist(grid_points, pointcloud, metric='euclidean')
-        
-        # 对于每个网格点，取到最近的点云距离
-        min_distances = np.min(distances, axis=1)
-        
-        # 计算SDF: 在点云内部距离为负，在外部为正
-        self.sdf_grid = min_distances.reshape(x_grid.shape)
-        
-        return self.sdf_grid
 
+        # 生成网格坐标
+        x_grid, y_grid = np.meshgrid(
+            np.arange(x_min, x_max, self.grid_size),
+            np.arange(y_min, y_max, self.grid_size),
+        )
+
+        pc = np.asarray(pointcloud, dtype=np.float32)
+        if pc.size == 0:
+            self.sdf_grid = np.full_like(x_grid, fill_value=float(self.r_max), dtype=np.float32)
+            return self.sdf_grid
+
+        # 期望 pc: [N,2]；如果传成了 [2,N]，尝试转置一次
+        if pc.ndim == 2 and pc.shape[0] == 2 and pc.shape[1] != 2:
+            pc = pc.T
+
+        # 筛选距离小于 r_max 的点（可能导致为空）
+        valid = (np.linalg.norm(pc, axis=1) <= self.r_max)
+        pc = pc[valid]
+        if pc.shape[0] == 0:
+            self.sdf_grid = np.full_like(x_grid, fill_value=float(self.r_max), dtype=np.float32)
+            return self.sdf_grid
+
+        # 将网格坐标展平并堆叠
+        grid_points = np.vstack([x_grid.ravel(), y_grid.ravel()]).T.astype(np.float32)
+
+        # 计算距离并取最小
+        distances = cdist(grid_points, pc, metric='euclidean')
+        min_distances = np.min(distances, axis=1)
+
+        self.sdf_grid = min_distances.reshape(x_grid.shape).astype(np.float32)
+        return self.sdf_grid
+    
     def plot(self, fname='logs/esdf_image.png'):
         """
         可视化生成的SDF（Signed Distance Field）网格。
