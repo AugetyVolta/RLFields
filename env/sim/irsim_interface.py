@@ -7,13 +7,19 @@ from irsim.lib import GeometryFactory
 def step_displacements(world, increments, robot_indices):
     # The policy already multiplies speed by dt. External mode keeps these
     # world-frame position increments and lets IR-SIM update sensors/status.
+    # External mode does not infer velocity from a new pose. Clear robots
+    # without an action, then supply the executed velocity in the body frame.
+    for robot in world.robot_list:
+        robot.set_velocity(np.zeros(robot.vel_shape))
     for index, increment in zip(robot_indices, increments):
         robot = world.robot_list[index]
         if robot.static or robot.stop_flag:
             continue
         state = robot.state.astype(float, copy=True)
-        state[:2, 0] += np.asarray(increment).reshape(-1)[:2]
+        delta = np.asarray(increment, dtype=float).reshape(2, 1)
+        state[:2] += delta
         robot.set_state(state)
+        robot.set_velocity(robot.vel_world2body(delta / world.step_time))
     world.step()
 
 

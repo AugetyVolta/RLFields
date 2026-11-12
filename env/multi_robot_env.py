@@ -13,7 +13,7 @@ class MultiRobotEnv(MultiAgentEnv):
         self.H = config.get("H", 80)
         self.num_robots = config.get("num_robots", 4)
         self.env_yaml_path = config["env_yaml_path"]
-        self.disable_plotting = config.get("disable_plotting", False)
+        self.disable_plotting = config.get("disable_plotting", True)
         
         # action dim
         self.action_dim = config.get("action_dim", 2)
@@ -64,4 +64,5 @@ class MultiRobotEnv(MultiAgentEnv):
         return obs, rewards, terminateds, truncateds, infos
 
     def close(self):
-        self.sim.env.close(ending_time=0)
+        # 绘图时 plt.pause(0) 会无限等待，使用正数以正常退出。
+        self.sim.env.close(ending_time=0.001)

@@ -6,7 +6,7 @@
 - 仿真使用 **IR-SIM 2.12.1 `[fast]`**，启用新版批量 LiDAR 和 numba 编译内核。
 - 默认训练 **10 个机器人、200 轮**；机器人半径 **0.1 m**，到达阈值 **0.3 m**。
 - SDF 梯度、context FFN、邻居 self-attention 默认开启；梯度缩放为 `8.0`、裁剪为 `1.0`。
-- 新训练必须指定环境目录；续训和评测读取已保存的实验配置。
+- 新训练必须指定环境目录，默认使用真正的 headless 模式；续训和评测读取已保存的实验配置。
 
 ## 1. 安装与运行位置
 
@@ -125,7 +125,7 @@ python train.py --env random_env_1 --override-config run_override.yaml
 
 **现在可以设置 `num_envs_per_env_runner=4`**：已验证同一 Ray 采样进程内 4 个环境、每个环境 10 个机器人，机器人编号、状态、激光及清理互相隔离。总采样环境数为 `num_env_runners × num_envs_per_env_runner`；CPU/GPU 配额按采样进程分配，无须为其中每个环境重复申请一份。环境在该进程中按序推进，策略推理可以合批；增加环境数不等于 CPU 步进同时并行，也不保证同比例加速。按服务器资源和实测吞吐量调整配置。
 
-服务器训练时使用 `disable_plotting: true`，会创建真正的 headless 环境；默认参数中仍保留原有绘图设置。
+新训练默认 `disable_plotting: true`，创建真正的 headless 环境，不生成 figure。显式设为 `false` 可开启训练绘图；评测用 `--render` 开启显示。续训仍优先读取旧 checkpoint 配置：若旧实验保存的是 `false`，请在覆盖 YAML 中明确设置 `experiment_params.disable_plotting: true`。
 
 只写需要覆盖的项即可。未知分组、拼错字段或尝试覆盖自动生成的路径会报错。`environment_info` 是导出信息，不是覆盖参数。修改网络结构或观测维度后，原 checkpoint 可能无法恢复。
 
@@ -288,19 +288,27 @@ python tools/migrate_checkpoint.py --checkpoint /path/to/old/checkpoint --output
 - 两个评测入口正常加载旧版/新版实验，实际切换为 3 / 20 个机器人，并导出指标 JSON。
 - `step_time=0.1 / 0.2` 的位移尺度、停止、到达、机器人碰撞与障碍物碰撞。
 
-配对固定动作回放结果如下，均为单线程 CPU、Ray 2.51.1、200 束 LiDAR；每种规模 2 组任务，每组预热 4 步、计时 12 步，表中是两组平均耗时的中位数：
+固定动作回放结果如下，均为单线程 CPU、Ray 2.51.1、200 束 LiDAR；每种规模 2 组任务，每组预热 4 步、计时 12 步，表中是两组平均耗时的中位数。旧版列沿用迁移前的同机记录，新版列为补齐接口后的复测：
 
 | 完整采样计算回放 | 旧自定义 IR-SIM 2.7.5 | 新 IR-SIM 2.12.1 fast | 加速 |
 | --- | --- | --- | --- |
-| 10 个机器人 | 296.9 ms/世界步 | 85.0 ms/世界步 | 3.49 倍 |
-| 20 个机器人 | 590.9 ms/世界步 | 171.3 ms/世界步 | 3.45 倍 |
+| 10 个机器人 | 296.9 ms/世界步 | 85.9 ms/世界步 | 3.46 倍 |
+| 20 个机器人 | 590.9 ms/世界步 | 171.5 ms/世界步 | 3.45 倍 |
 
 所有计时步处理全部机器人，包含真实冻结策略前向、仿真、LiDAR、规划场和 UDF，不包含 PPO 更新或 Ray 通信。在这些配对轨迹上，位置、观测、策略输出、奖励和终止标记完全一致，测距误差小于 `1.4e-14 m`。这不能直接推算整轮训练或 GPU 吞吐量的加速，也不代表重跑了完整 200 轮收敛实验。
 
 ## 10. 新仿真器如何兼容原模型
 
-旧分支的动作实际是已经乘过 `dt` 的世界坐标位移；新版默认接收速度。当前通过官方 `step_mode: external` 写入同样的位移，再由新版同步几何、传感器、碰撞和时间，避免动作被重复乘以 `dt`。
+旧分支的动作实际是已经乘过 `dt` 的世界坐标位移；新版默认接收速度。当前使用官方 `step_mode: external`，按以下约定更新：
 
-项目内 `env/sim/irsim_interface.py` 保留原任务采样所需的几何和起终点间距约束，采样只读取本环境对象和独立 RNG。策略点云仍按旧版的角度增量构造，实际射线和测距使用新版加速实现。这样保留 PGRL 的模型结构与输入接口，可以继续使用原规划器权重及兼容的策略 checkpoint。
+1. `prior_world` 是世界坐标中的先验方向。策略输出的 `theta_action` 旋转这个方向；它不是机器人姿态角或角速度。
+2. `v = clip((alpha + 1) / 2, 0, 1) * v_max`，世界位移为 `delta_world = v * step_time * R(pi * theta_action) * prior_world`。只累加世界 `x/y`，保留 omni 机器人的姿态角。
+3. 同时同步真实速度：`velocity_world = delta_world / step_time`，通过 `robot.vel_world2body()` 转为新版 omni 的机体坐标速度，再调用 `set_velocity()`。没有动作或已经停止的机器人速度置零。
+4. 所有机器人的位姿和速度写入后，统一调用一次不带 action 的 `env.step()`。由 IR-SIM 刷新全部几何、碰撞树、LiDAR、碰撞/到达状态和轨迹，并且只推进一个 `step_time`；不再重复积分位移。
 
+点云先从 LiDAR 坐标变换为相对机器人位置的世界坐标，再转到先验方向对齐坐标；变换包括机器人姿态和传感器安装平移/旋转。策略点云仍保留旧版角度增量约定，实际射线和测距使用新版加速实现。默认零姿态、零安装偏移的历史模型回放保持一致。
+
+项目内 `env/sim/irsim_interface.py` 保留原任务采样所需的几何和起终点间距约束。每个环境在创建时就获得独立 RNG，采样只读取本环境对象。模型结构保持不变，可继续使用原规划器权重及兼容的策略 checkpoint。
+
+按[环境创建指南](https://ir-sim.readthedocs.io/zh-cn/stable/usage/make_environment.html)及[多环境指南](https://ir-sim.readthedocs.io/en/latest/usage/multiple_environments.html)复核，并对照实际安装的 2.12.1 源码检查了同步流程。补充测试覆盖 `dt=0.1 / 0.2`、5 种机器人朝向、非零 LiDAR 安装偏移、机体/世界速度及里程计、无动作/停止后的速度清零、同一几何快照的传感器更新，以及 refresh 不推进时钟。
 当前任务沿用 `omni`、`circle` 和原碰撞判定。external 模式由项目负责运动更新；它不执行新版 `contact` 刚体动力学，也不自动推进配置中的自主运动障碍物。

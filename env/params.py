@@ -138,7 +138,7 @@ class RewardConfig:
 
 @dataclass
 class ExprimentConfig:
-    disable_plotting: bool = False
+    disable_plotting: bool = True
     max_iters: int = 200
 
     num_env_runners: int = 2

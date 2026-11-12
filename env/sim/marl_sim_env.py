@@ -22,7 +22,7 @@ class MARL_SIM(SIM_ENV):
     def __init__(
         self,
         world_file=None,
-        disable_plotting=False,
+        disable_plotting=True,
         scene_cfg = None
     ):
         scene_cfg = SceneConfig() if scene_cfg is None else scene_cfg
@@ -32,9 +32,9 @@ class MARL_SIM(SIM_ENV):
             yaml.safe_dump(env_config, f, allow_unicode=True, sort_keys=False)
             f.flush()
             self.env = irsim.make(
-                f.name, headless=disable_plotting, display=self.render, step_mode='external'
+                f.name, headless=disable_plotting, display=self.render, step_mode='external',
+                seed=np.random.SeedSequence().entropy  # 创建时就使用本环境独立的 RNG。
             )
-        self.env.set_random_seed()  # 每个环境使用独立的随机数生成器。
         self.num_robots = len(self.env.robot_list)
         self.robot_list = self.env.robot_list
         self.obstacle_list = self.env.obstacle_list
@@ -292,6 +292,13 @@ class MARL_SIM(SIM_ENV):
         scan['angle_increment'] = (scan['angle_max'] - scan['angle_min']) / len(scan['ranges'])
         pointcloud = lidar_to_pointcloud(scan)
         if pointcloud.size > 0:
+            # LiDAR 坐标 -> 世界坐标中的相对点 -> 先验方向对齐坐标。
+            sensor_pose = robot.lidar.lidar_origin
+            angle = float(sensor_pose[2, 0])
+            c, s = math.cos(angle), math.sin(angle)
+            sensor_to_world = np.array([[c, -s], [s, c]], dtype=np.float32)
+            pointcloud = self._rot_vecs(pointcloud, sensor_to_world)
+            pointcloud += (sensor_pose[:2, 0] - robot.state[:2, 0]).astype(np.float32)
             pointcloud = self._rot_vecs(pointcloud, R)
         sdf_grid = self.esdf.generate_sdf_from_pointcloud(pointcloud)
         sdf_grid = np.clip(sdf_grid, 0.0, self.r_max) / self.r_max # sdf归一化到 [0, 1]
