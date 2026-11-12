@@ -1,6 +1,6 @@
 logs/
 __pycache__/
 # config/
-*.pt
+# *.pt
 TODO
 *.json
