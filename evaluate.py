@@ -1,3 +1,5 @@
+import os
+import torch
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.models import ModelCatalog
@@ -9,6 +11,7 @@ from env.params import SceneConfig
 
 def build_ppo_config_multiagent(cfg: SceneConfig):
     ModelCatalog.register_custom_model("rlfields_actor", RLFieldsActorModel)
+    ModelCatalog.register_custom_model("rlfields_actor_prior", RLFieldsActorModel)
 
     config = (
         PPOConfig()
@@ -19,10 +22,11 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
         .environment(env=MultiRobotEnv, env_config=cfg.get_env_config())
         .framework("torch")
         .env_runners(
-            num_env_runners=cfg.experiment_params.num_env_runners,
+            # 手动推进主进程中的评测环境，不创建远程采样进程。
+            num_env_runners=0,
             num_envs_per_env_runner=cfg.experiment_params.num_envs_per_env_runner,
             num_cpus_per_env_runner=cfg.experiment_params.num_cpus_per_env_runner,
-            num_gpus_per_env_runner=cfg.experiment_params.num_gpus_per_env_runner,
+            num_gpus_per_env_runner=0,
             rollout_fragment_length=cfg.experiment_params.rollout_fragment_length,
             sample_timeout_s=None,
         )
@@ -75,20 +79,29 @@ def step_compat(env, action_dict):
     raise RuntimeError(f"Unexpected env.step return: {out}")
 
 if __name__ == "__main__":
-    ckpt_path = "/home/zby/桌面/test/iter_000097"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu")
+    args = parser.parse_args()
+    ckpt_path = os.path.abspath(os.path.expanduser(args.ckpt))
 
     ray.init(log_to_driver=False, ignore_reinit_error=True)
 
-    cfg = SceneConfig()
+    cfg = SceneConfig.from_checkpoint(ckpt_path)
+    cfg.experiment_params.disable_plotting = not args.render
+    cfg.network_params.device = args.device
     config = build_ppo_config_multiagent(cfg)
 
     config = (
         config
-        .env_runners(num_env_runners=1, 
+        .env_runners(num_env_runners=0,
                      num_envs_per_env_runner=1,
                      num_cpus_per_env_runner=20)
     )
 
+    config = config.resources(num_gpus=1 if args.device == "cuda" else 0)
     algo = config.build()
     algo.restore(ckpt_path)
 

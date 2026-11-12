@@ -1,6 +1,7 @@
 import numpy as np
 from gymnasium.spaces import Box
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from .params import SceneConfig
 from .sim.marl_sim_env import MARL_SIM
 
 class MultiRobotEnv(MultiAgentEnv):
@@ -26,7 +27,8 @@ class MultiRobotEnv(MultiAgentEnv):
         self.agents = self.possible_agents = [f'robot_{i}' for i in range(self.num_robots)]
         
         # sim
-        self.sim = MARL_SIM(self.env_yaml_path, disable_plotting=self.disable_plotting)
+        scene_cfg = SceneConfig.from_dict(config.get("scene_config", {}))
+        self.sim = MARL_SIM(self.env_yaml_path, disable_plotting=self.disable_plotting, scene_cfg=scene_cfg)
     
     def get_observation_space(self, agent_id):
         if agent_id.startswith("robot_"):

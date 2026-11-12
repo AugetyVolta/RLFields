@@ -24,6 +24,7 @@ def make_logger_creator(logdir: str):
 def build_ppo_config_multiagent(cfg: SceneConfig):
     # 注册自定义 ModelV2
     ModelCatalog.register_custom_model("rlfields_actor", RLFieldsActorModel)
+    ModelCatalog.register_custom_model("rlfields_actor_prior", RLFieldsActorModel)
 
     config = (
         PPOConfig()
@@ -115,10 +116,25 @@ def prepare_exp(cfg: SceneConfig):
     return algo, exp_info
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", default=None)
+    args = parser.parse_args()
+
     cfg = SceneConfig()
+    restore_ckpt_path = args.ckpt or cfg.experiment_params.restore_ckpt_path
+    if restore_ckpt_path:
+        restore_ckpt_path = os.path.abspath(os.path.expanduser(restore_ckpt_path))
+        cfg = SceneConfig.from_checkpoint(restore_ckpt_path)
+        cfg.experiment_params.restore_ckpt_path = restore_ckpt_path
     algo, exp_info = prepare_exp(cfg)
 
-    for it in range(cfg.experiment_params.max_iters):
+    resume_it = 0
+    if restore_ckpt_path:
+        algo.restore(restore_ckpt_path)
+        resume_it = algo.iteration
+
+    for it in range(resume_it, cfg.experiment_params.max_iters):
         result = algo.train()
         print(f"[{exp_info['exp_name']}] iter={it}", result)   
 

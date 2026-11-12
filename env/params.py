@@ -1,7 +1,11 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field, fields
 from typing import Any, Dict
 import yaml
 import os
+from pathlib import Path
+import pickle
+import sys
+import types
 
 @dataclass
 class ESDF_Cfg:
@@ -168,13 +172,13 @@ class AlgorithmConfig:
 
 @dataclass
 class SceneConfig:
-    scene_params: SceneParameters = SceneParameters()
-    robot_params: RobotParameters = RobotParameters()
-    esdf_params : ESDF_Cfg = ESDF_Cfg()
-    network_params : RLFieldsConfig = RLFieldsConfig()
-    reward_params : RewardConfig = RewardConfig()
-    experiment_params : ExprimentConfig = ExprimentConfig()
-    algorithm_params : AlgorithmConfig = AlgorithmConfig()
+    scene_params: SceneParameters = field(default_factory=SceneParameters)
+    robot_params: RobotParameters = field(default_factory=RobotParameters)
+    esdf_params : ESDF_Cfg = field(default_factory=ESDF_Cfg)
+    network_params : RLFieldsConfig = field(default_factory=RLFieldsConfig)
+    reward_params : RewardConfig = field(default_factory=RewardConfig)
+    experiment_params : ExprimentConfig = field(default_factory=ExprimentConfig)
+    algorithm_params : AlgorithmConfig = field(default_factory=AlgorithmConfig)
 
     def get_env_config(self) -> Dict[str, Any]:
         """給 env_config."""
@@ -186,7 +190,8 @@ class SceneConfig:
             "num_robots": self.robot_params.number_robots,
             "action_dim": self.network_params.nt_dim,
             "env_yaml_path": self.experiment_params.env_yaml_path,
-            "disable_plotting": self.experiment_params.disable_plotting
+            "disable_plotting": self.experiment_params.disable_plotting,
+            "scene_config": asdict(self)
         }
 
     def get_network_config(self) -> Dict[str, Any]:
@@ -235,3 +240,80 @@ class SceneConfig:
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, allow_unicode=True)
 
+
+    @classmethod
+    def from_dict(cls, data):
+        cfg = cls()
+        for item in fields(cfg):
+            section = getattr(cfg, item.name)
+            for key, value in data.get(item.name, {}).items():
+                if hasattr(section, key):
+                    setattr(section, key, value)
+        cfg.esdf_params.resolution = (cfg.esdf_params.x_max - cfg.esdf_params.x_min) / cfg.esdf_params.map_size
+        return cfg
+
+    @classmethod
+    def from_checkpoint(cls, ckpt_path):
+        # 评测/续训读取保存时的结构，不需要手动切换 prior_align 或增强开关。
+        path = Path(ckpt_path).expanduser().resolve()
+        policy_file = path / 'policies/shared_policy/policy_state.pkl'
+        if not policy_file.is_file():
+            policy_file = path / 'policy_state.pkl'
+        if not policy_file.is_file():
+            raise FileNotFoundError(f'No shared_policy checkpoint in {path}')
+        # 历史 checkpoint 中的旧类路径只在内存中映射，不保留重复实现文件。
+        from .multi_robot_env import MultiRobotEnv
+        from .sim.marl_sim_env import MARL_SIM
+        from model.models import RLFields
+        from model.policy_value_network import RLFieldsActorModel
+        for module_name, class_name, target in [
+            ("env.multi_robot_env_prior_align", "MultiRobotEnvPriorAlign", MultiRobotEnv),
+            ("env.sim.marl_sim_env_prior_align", "MARL_SIM_PriorAlign", MARL_SIM),
+            ("model.models_prior_align", "RLFieldsPriorAlign", RLFields),
+            ("model.policy_value_network_prior_align", "RLFieldsActorModelPriorAlign", RLFieldsActorModel),
+        ]:
+            module = types.ModuleType(module_name)
+            setattr(module, class_name, target)
+            sys.modules.setdefault(module_name, module)
+        with policy_file.open('rb') as f:
+            state = pickle.load(f)
+        policy_cfg = state['policy_spec']['config']
+        cfg = cls.from_dict(policy_cfg.get("env_config", {}).get("scene_config", {}))
+        run_dir = None
+        for parent in path.parents:
+            snapshot = parent / 'scene_config.yaml'
+            if not snapshot.is_file():
+                snapshot = parent / 'scene_config_resume.yaml'
+            if snapshot.is_file():
+                with snapshot.open(encoding='utf-8') as f:
+                    cfg = cls.from_dict(yaml.safe_load(f) or {})
+                run_dir = parent
+                break
+        model_cfg = policy_cfg['model'].get('custom_model_config', {})
+        for key, value in model_cfg.items():
+            if hasattr(cfg.network_params, key):
+                setattr(cfg.network_params, key, value)
+        weights = state['weights']
+        if 'fused_ln.weight' not in weights:
+            raise ValueError('This checkpoint uses non-aligned observations; use a prior_align checkpoint.')
+        cfg.network_params.use_sdf_grad = weights['rlfields.env_encoder.obstacle_encoder.feature_extractor.0.weight'].shape[1] == 3
+        cfg.network_params.use_ctx_ffn = any('.ctx_ffn.' in key for key in weights)
+        cfg.network_params.use_neigh_self_attn = any('.neigh_self_attn.' in key for key in weights)
+        env_cfg = policy_cfg.get('env_config', {})
+        cfg.robot_params.number_robots = env_cfg.get('num_robots', cfg.robot_params.number_robots)
+        cfg.network_params.num_use_neighbor_obs = env_cfg.get('num_use_neighbor_obs', cfg.network_params.num_use_neighbor_obs)
+        cfg.esdf_params.map_size = env_cfg.get('H', cfg.esdf_params.map_size)
+        cfg.esdf_params.resolution = (cfg.esdf_params.x_max - cfg.esdf_params.x_min) / cfg.esdf_params.map_size
+        cfg.experiment_params.env_yaml_path = env_cfg.get('env_yaml_path', cfg.experiment_params.env_yaml_path)
+        root = Path(__file__).resolve().parents[1]
+        for section, key, archive, default in [
+            (cfg.experiment_params, 'env_yaml_path', 'env.yaml', root / 'config/random_env.yaml'),
+            (cfg.network_params, 'nt_pretrained_path', 'ntfields.pt', root / 'ckpt.pt'),
+        ]:
+            value = Path(getattr(section, key)).expanduser()
+            candidates = ([run_dir / archive] if run_dir else []) + [value, root / value, default]
+            selected = next((p for p in candidates if p.is_file()), None)
+            if selected is None:
+                raise FileNotFoundError(f'Missing {key}: {default}')
+            setattr(section, key, str(selected.resolve()))
+        return cfg

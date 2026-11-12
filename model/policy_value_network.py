@@ -54,7 +54,7 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
             env_output_feature=cfg.get("env_output_feature", 256),
             fusion_mode=cfg.get("fusion_mode", "film"),
             use_sdf_grad=cfg.get("use_sdf_grad", True),
-            sdf_grad_scale=cfg.get("sdf_grad_scale", 1.0),
+            sdf_grad_scale=cfg.get("sdf_grad_scale", 8.0),
             sdf_grad_clip=cfg.get("sdf_grad_clip", 1.0),
             use_ctx_ffn=cfg.get("use_ctx_ffn", True),
             use_neigh_self_attn=cfg.get("use_neigh_self_attn", True),
@@ -83,6 +83,10 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
             nn.SiLU(),
             nn.Linear(self.prior_embed_dim, self.prior_embed_dim),
         )
+
+        # 对齐两路特征的尺度，稳定融合
+        self.fused_ln = nn.LayerNorm(self.fused_feat_dim)
+        self.prior_ln = nn.LayerNorm(self.prior_embed_dim)
 
         # ==== 残差头：输入 = fused_feat + prior_feat ====
         delta_input_dim = self.fused_feat_dim + self.prior_embed_dim
@@ -139,6 +143,8 @@ class RLFieldsActorModel(TorchModelV2, nn.Module):
         prior_feat = self.prior_mlp(prior_dir)  # [B, prior_embed_dim]
 
         # ===== policy head 输入：环境特征 + 先验 embedding =====
+        fused_feat = self.fused_ln(fused_feat)
+        prior_feat = self.prior_ln(prior_feat)
         delta_in = torch.cat([fused_feat, prior_feat], dim=-1)  # [B, T + prior_embed_dim]
 
         # 输出动作: [alpha_raw, theta_raw]，都在 [-1, 1]

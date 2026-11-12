@@ -1,3 +1,5 @@
+import os
+import torch
 
 import argparse
 from collections import defaultdict
@@ -13,6 +15,7 @@ from env.params import SceneConfig
 
 def build_ppo_config_multiagent(cfg: SceneConfig) -> PPOConfig:
     ModelCatalog.register_custom_model("rlfields_actor", RLFieldsActorModel)
+    ModelCatalog.register_custom_model("rlfields_actor_prior", RLFieldsActorModel)
     config = (
         PPOConfig()
         .api_stack(
@@ -22,11 +25,12 @@ def build_ppo_config_multiagent(cfg: SceneConfig) -> PPOConfig:
         .environment(env=MultiRobotEnv, env_config=cfg.get_env_config())
         .framework("torch")
         .env_runners(
-            num_env_runners=1,
+            # 手动推进主进程中的评测环境，不创建远程采样进程。
+            num_env_runners=0,
             num_envs_per_env_runner=1,
             # 评估不需要太多 CPU；你也可以从命令行覆盖
             num_cpus_per_env_runner=20,
-            num_gpus_per_env_runner=cfg.experiment_params.num_gpus_per_env_runner,
+            num_gpus_per_env_runner=0,
             rollout_fragment_length=cfg.experiment_params.rollout_fragment_length,
             sample_timeout_s=None,
         )
@@ -284,12 +288,18 @@ def main():
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--out_json", type=str, default="", help="Optional path to dump episode summaries as json")
+    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+    args.ckpt = os.path.abspath(os.path.expanduser(args.ckpt))
 
     ray.init(log_to_driver=False, ignore_reinit_error=True)
 
-    cfg = SceneConfig()
-    config = build_ppo_config_multiagent(cfg).env_runners(num_env_runners=1, num_envs_per_env_runner=1, num_cpus_per_env_runner=args.cpus)
+    cfg = SceneConfig.from_checkpoint(args.ckpt)
+    cfg.experiment_params.disable_plotting = not args.render
+    cfg.network_params.device = args.device
+    config = build_ppo_config_multiagent(cfg).env_runners(num_env_runners=0, num_envs_per_env_runner=1, num_cpus_per_env_runner=args.cpus)
+    config = config.resources(num_gpus=1 if args.device == "cuda" else 0)
     algo = config.build()
     algo.restore(args.ckpt)
 

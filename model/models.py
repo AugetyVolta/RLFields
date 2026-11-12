@@ -423,6 +423,9 @@ class EnvEncoder(nn.Module):
             pad_mask = None
             if neighbor_mask is not None:
                 pad_mask = ~neighbor_mask  # True 表示 padding
+                # 无邻居行保留一个零 token，避免 softmax 全屏蔽时反向出现 NaN。
+                pad_mask = pad_mask.clone()
+                pad_mask[pad_mask.all(dim=1), 0] = False
             attn_out, _ = self.neigh_self_attn(
                 neigh_tokens, neigh_tokens, neigh_tokens,
                 key_padding_mask=pad_mask,
@@ -615,6 +618,11 @@ class LateFusionHead(nn.Module):
             return self.post(torch.cat([z, c], dim=1))
 
 class RLFields(nn.Module):
+    """
+    RLFields with goal_rel rotated into prior-aligned coordinate frame.
+    - Keeps NTFields branch in world coordinates (self_obs unchanged).
+    - Only rotates goal_rel for EnvEncoder input, so local features align with prior.
+    """
     def __init__(
         self, 
         self_obs_dim: int = 4,
@@ -740,6 +748,20 @@ class RLFields(nn.Module):
             mode=self.fusion_mode
         )
     
+    @staticmethod
+    def _rot_from_prior(prior_dir: torch.Tensor) -> torch.Tensor:
+        """
+        prior_dir: [B,2]
+        return R: [B,2,2] such that R * v_world = v_prior_frame
+        """
+        pn = torch.norm(prior_dir, dim=-1, keepdim=True).clamp_min(1e-6)
+        c = prior_dir[:, 0:1] / pn
+        s = prior_dir[:, 1:2] / pn
+        row0 = torch.cat([c, s], dim=1)
+        row1 = torch.cat([-s, c], dim=1)
+        return torch.stack([row0, row1], dim=1)
+
+
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         B = observations.shape[0]
 
@@ -773,9 +795,23 @@ class RLFields(nn.Module):
         assert H * H == sdf_len, f"sdf_input 展平长度 {sdf_len} 不能组成正方形图像"
         sdf_input = sdf_flat.view(B, 1, H, H)                    # [B, 1, H, H]
 
+        # -------- prior-aligned goal_rel（只给 EnvEncoder） --------
+        half_dim = self.self_obs_dim // 2
+        start = self_obs[:, :half_dim]
+        goal = self_obs[:, half_dim:]
+        goal_rel = goal - start                                  # [B, 2]
+
+        R = self._rot_from_prior(prior_dir[:, :2])
+        goal_rel_rot = torch.bmm(R, goal_rel.unsqueeze(-1)).squeeze(-1)
+
+        # 构造“仅用于 EnvEncoder”的 self_obs：
+        # start_rel 恒为 0，所以 start 直接给 0；goal 给旋转后的 goal_rel
+        zeros = torch.zeros_like(start)
+        self_obs_for_env = torch.cat([zeros, goal_rel_rot], dim=-1)
+
         # -------- 4) 环境编码 --------
         env_embedding = self.env_encoder(
-            self_obs=self_obs,
+            self_obs=self_obs_for_env,
             neighbor_obs=neighbor_obs,
             sdf_input=sdf_input,
             neighbor_mask=neighbor_mask,

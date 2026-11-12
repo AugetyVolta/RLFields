@@ -10,12 +10,19 @@ from utils.utils import lidar_to_pointcloud
 from .sim_env import SIM_ENV
 
 class MARL_SIM(SIM_ENV):
+    """
+    Prior-aligned variant:
+    - Lidar pointcloud rotated so prior_dir becomes +x axis.
+    - Neighbor relative positions/goals rotated to the same prior-aligned frame.
+    - self_obs absolute coords and prior_dir itself are kept unchanged.
+    """
     def __init__(
         self,
         world_file="config/random_env.yaml",
         disable_plotting=False,
-        scene_cfg = SceneConfig()
+        scene_cfg = None
     ):
+        scene_cfg = SceneConfig() if scene_cfg is None else scene_cfg
         self.render = False if disable_plotting else True
         self.env = irsim.make(
             world_file, disable_all_plot=disable_plotting, display=self.render
@@ -186,6 +193,27 @@ class MARL_SIM(SIM_ENV):
 
         return obs, rewards, terminateds, truncateds, infos
     
+    @staticmethod
+    def _rot_from_prior(prior_dir: np.ndarray) -> np.ndarray:
+        p = np.asarray(prior_dir, dtype=np.float32).reshape(-1)
+        if p.shape[0] < 2:
+            return np.eye(2, dtype=np.float32)
+        px, py = float(p[0]), float(p[1])
+        n = math.hypot(px, py)
+        if n < 1e-6:
+            return np.eye(2, dtype=np.float32)
+        c = px / n
+        s = py / n
+        # rotate world vectors into prior-aligned frame (prior -> +x)
+        return np.array([[c, s], [-s, c]], dtype=np.float32)
+
+
+    @staticmethod
+    def _rot_vecs(vecs: np.ndarray, R: np.ndarray) -> np.ndarray:
+        # vecs: (..., 2)
+        return vecs @ R.T
+
+
     def _prepare_obs(self, id: int):
         """
         返回当前机器人 id 的观测:
@@ -209,6 +237,8 @@ class MARL_SIM(SIM_ENV):
         robot_goal_norm = (robot_goal - self.world_center) / self.world_scale
 
         self_obs = np.concatenate([robot_pos_norm, robot_goal_norm], axis=0)  # (self.self_obs_dim,)        
+        # prior-aligned rotation：局部几何和邻居统一到先验方向坐标系。
+        R = self._rot_from_prior(self.robot_last_prior_dir[id])
         # ===== 2) neighbor_obs: 以当前机器人为中心的邻居 [rel_x, rel_y, rel_goal_x, rel_goal_y] =====
         neighbor_feats = []
         for j, other in enumerate(self.robot_list):
@@ -225,6 +255,9 @@ class MARL_SIM(SIM_ENV):
                 # 这里用“相对于当前机器人位置”的相对坐标, 同时进行缩放
                 rel_pos = other_pos - robot_pos
                 rel_goal = other_goal - robot_pos
+                # rotate to prior-aligned frame
+                rel_pos = self._rot_vecs(rel_pos.reshape(1, 2), R)[0]
+                rel_goal = self._rot_vecs(rel_goal.reshape(1, 2), R)[0]
                 rel_pos_norm = rel_pos / self.world_scale
                 rel_goal_norm = rel_goal / self.world_scale
                 feat = np.concatenate([rel_pos_norm, rel_goal_norm], axis=0)
@@ -247,6 +280,8 @@ class MARL_SIM(SIM_ENV):
 
         # ===== 3) ESDF/SDF 观测 =====
         pointcloud = lidar_to_pointcloud(robot.lidar.get_scan())
+        if pointcloud.size > 0:
+            pointcloud = self._rot_vecs(pointcloud, R)
         sdf_grid = self.esdf.generate_sdf_from_pointcloud(pointcloud)
         sdf_grid = np.clip(sdf_grid, 0.0, self.r_max) / self.r_max # sdf归一化到 [0, 1]
         sdf_flat = sdf_grid.flatten()  # (map_size*map_size,)
