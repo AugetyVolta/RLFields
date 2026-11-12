@@ -10,6 +10,7 @@ from .esdf_2d_simple import ESDF_2d
 from ..params import SceneConfig
 from utils.utils import lidar_to_pointcloud
 from .sim_env import SIM_ENV
+from .irsim_interface import step_displacements, sample_free_position
 
 class MARL_SIM(SIM_ENV):
     """
@@ -31,8 +32,9 @@ class MARL_SIM(SIM_ENV):
             yaml.safe_dump(env_config, f, allow_unicode=True, sort_keys=False)
             f.flush()
             self.env = irsim.make(
-                f.name, disable_all_plot=disable_plotting, display=self.render
+                f.name, headless=disable_plotting, display=self.render, step_mode='external'
             )
+        self.env.set_random_seed()  # 每个环境使用独立的随机数生成器。
         self.num_robots = len(self.env.robot_list)
         self.robot_list = self.env.robot_list
         self.obstacle_list = self.env.obstacle_list
@@ -133,7 +135,7 @@ class MARL_SIM(SIM_ENV):
             exec_dirs[id] = exec_dir
             exec_speeds[id] = v
 
-        self.env.step(action=applied_actions, action_id=action_ids)
+        step_displacements(self.env, applied_actions, action_ids)
         if self.render:
             self.env.render()
         self._env_step_id += 1
@@ -285,7 +287,10 @@ class MARL_SIM(SIM_ENV):
         neighbor_obs_flat = neighbor_obs.reshape(-1)  # (K * neighbor_obs_dim,)
 
         # ===== 3) ESDF/SDF 观测 =====
-        pointcloud = lidar_to_pointcloud(robot.lidar.get_scan())
+        scan = robot.lidar.get_scan().copy()
+        # 保留已有策略的点云角度接口，物理射线和测距使用新版加速实现。
+        scan['angle_increment'] = (scan['angle_max'] - scan['angle_min']) / len(scan['ranges'])
+        pointcloud = lidar_to_pointcloud(scan)
         if pointcloud.size > 0:
             pointcloud = self._rot_vecs(pointcloud, R)
         sdf_grid = self.esdf.generate_sdf_from_pointcloud(pointcloud)
@@ -912,8 +917,8 @@ class MARL_SIM(SIM_ENV):
             robot.set_state(np.array(robot_state), init=True)
         else:
             for _ in range(max_attempts):
-                free_pos = robot.get_random_free_position(
-                    self.env.objects,
+                free_pos = sample_free_position(
+                    self.env, robot,
                     free = True,
                     filter_start_goal = True,
                     range_limits=[
@@ -930,8 +935,8 @@ class MARL_SIM(SIM_ENV):
             robot.set_goal(np.array(robot_goal), init=True)
         else:
             for _ in range(max_attempts):
-                free_pos = robot.get_random_free_position(
-                    self.env.objects,
+                free_pos = sample_free_position(
+                    self.env, robot,
                     free = True,
                     filter_start_goal = True,
                     range_limits=[

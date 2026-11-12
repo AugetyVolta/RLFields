@@ -3,6 +3,7 @@
 多机器人导航训练与评测代码。当前统一使用标准模块和共享策略，不需要选择不同版本。
 
 - 使用 **Ray/RLlib 2.51.1，Policy + ModelV2 旧 API 栈**。
+- 仿真使用 **IR-SIM 2.12.1 `[fast]`**，启用新版批量 LiDAR 和 numba 编译内核。
 - 默认训练 **10 个机器人、200 轮**；机器人半径 **0.1 m**，到达阈值 **0.3 m**。
 - SDF 梯度、context FFN、邻居 self-attention 默认开启；梯度缩放为 `8.0`、裁剪为 `1.0`。
 - 新训练必须指定环境目录；续训和评测读取已保存的实验配置。
@@ -10,17 +11,21 @@
 ## 1. 安装与运行位置
 
 ```bash
-conda create -n irsim python=3.10
-conda activate irsim
+conda create -n pgrl python=3.10
+conda activate pgrl
 python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu118
 python -m pip install -r requirements.txt
 ```
 
-本项目依赖已有的**自定义 IR-SIM 分支**，需要支持 `get_random_free_position(..., filter_start_goal=...)` 等现有接口。`requirements.txt` 中的 `ir-sim==2.7.5` 仅记录基础版本，不能用普通发行包替代该分支。安装依赖后，将自己的分支安装到同一 Python 环境，例如：
+`requirements.txt` 已固定 `ir-sim[fast]==2.12.1`；使用官方发行包，不再安装原来的自定义 IR-SIM 分支。`[fast]` 会安装 numba/llvmlite，第一次启动需要编译 LiDAR 内核，后续使用缓存。比较吞吐量时应先预热。
+
+迁移已准备独立的本地运行环境，不改动原 Conda 环境。当前机器可以直接使用：
 
 ```bash
-python -m pip install -e /path/to/your/ir-sim
+source ~/.venvs/pgrl-irsim2121/bin/activate
 ```
+
+这个本地环境复用原 Conda 环境中的基础依赖，单独安装新仿真器和 Ray。全新机器请使用上面的 Conda 安装步骤。
 
 以下命令均在项目根目录执行：
 
@@ -67,7 +72,7 @@ python train.py --env my_map
 
 文件名不要求与目录名相同，YAML 和权重也不要求同名。缺少候选或存在多份候选都会报错，不会猜选。没有默认环境，也不会退回根目录寻找默认权重。
 
-当前三个环境的 YAML、OBJ 随仓库保存；`.pt` 权重由 Git 忽略，需要从已有 NAS 数据或自己的规划器训练结果复制到对应目录。选择环境时会同时选择该目录中的地图和权重，仍需保证两者确实匹配。
+当前三个环境的 YAML、OBJ 和预训练 `.pt` 权重均已随仓库保存。新增环境时，将对应地图和为其训练的 PC-Planner 权重一起放入新目录；选择目录会同时选中地图和权重，仍需保证两者确实匹配。
 
 ## 3. 参数在何处修改
 
@@ -86,7 +91,7 @@ python train.py --env my_map
 
 机器人和仿真时间参数在创建 IR-SIM 前覆盖地图 YAML，**不用同时修改地图文件**。`sample_time: null` 表示跟随 `step_time`；显式设置时必须是 `step_time` 的正整数倍。动作位移尺度直接使用 `step_time`。
 
-已有地图的大小、偏移和障碍物布局从所选 YAML 读取。当前机器人固定为 `omni`、`circle`，不再单独配置。实际地图信息和自动解析的路径会导出到 `scene_config.yaml` 的 `environment_info` 等字段；实际仿真配置归档为 `env.yaml`。
+已有地图的大小、偏移和障碍物布局从所选 YAML 读取。当前机器人固定为 `omni`、`circle`，不再单独配置。实际地图信息、固定的 `step_mode: external` 和自动解析的路径会导出到 `scene_config.yaml` 的 `environment_info` 等字段；实际仿真配置归档为 `env.yaml`。
 
 ### 按本次实验覆盖参数
 
@@ -104,7 +109,7 @@ experiment_params:
   disable_plotting: true
   max_iters: 200
   num_env_runners: 8
-  num_envs_per_env_runner: 1
+  num_envs_per_env_runner: 4
   num_cpus_per_env_runner: 3
   num_gpus_per_env_runner: 0.25
   num_cpus_for_main_process: 4
@@ -116,7 +121,11 @@ algorithm_params:
 python train.py --env random_env_1 --override-config run_override.yaml
 ```
 
-上面是可选的服务器配置示例。代码当前资源默认值为：`num_env_runners=2`、每进程一个环境、每进程 `10` CPU / `0.5` GPU、主进程 `4` CPU。按服务器资源调整采样进程数和配额；当前自定义 IR-SIM 的使用方式保持 `num_envs_per_env_runner=1`。
+上面是可选的服务器配置示例。代码当前资源默认值为：`num_env_runners=2`、每进程一个环境、每进程 `10` CPU / `0.5` GPU、主进程 `4` CPU。
+
+**现在可以设置 `num_envs_per_env_runner=4`**：已验证同一 Ray 采样进程内 4 个环境、每个环境 10 个机器人，机器人编号、状态、激光及清理互相隔离。总采样环境数为 `num_env_runners × num_envs_per_env_runner`；CPU/GPU 配额按采样进程分配，无须为其中每个环境重复申请一份。环境在该进程中按序推进，策略推理可以合批；增加环境数不等于 CPU 步进同时并行，也不保证同比例加速。按服务器资源和实测吞吐量调整配置。
+
+服务器训练时使用 `disable_plotting: true`，会创建真正的 headless 环境；默认参数中仍保留原有绘图设置。
 
 只写需要覆盖的项即可。未知分组、拼错字段或尝试覆盖自动生成的路径会报错。`environment_info` 是导出信息，不是覆盖参数。修改网络结构或观测维度后，原 checkpoint 可能无法恢复。
 
@@ -272,6 +281,26 @@ python tools/migrate_checkpoint.py --checkpoint /path/to/old/checkpoint --output
 
 ## 9. 已完成的功能验证
 
-已在隔离环境中用 Ray 2.51.1 旧栈完成 CPU 短流程验证：新训练、原目录续训、新目录续训、两个评测入口、实际机器人数量覆盖，以及历史第 200 轮 checkpoint 迁移后的加载与评测；检查了优化器恢复、权重一致性和日志布局。
+原版已完成新训练、原目录/新目录续训、两个评测入口，以及历史模型命名迁移的短流程验证。本次 IR-SIM 迁移另外在 Ray 2.51.1 旧栈、CPU 条件下验证了：
 
-这是接口与数据流验证，不代表重新完成了 200 轮收敛实验，也不是 GPU 吞吐量测试。
+- 同进程 4 个环境、每环境 10 个机器人：编号、位置、LiDAR、随机数生成器隔离；创建或关闭其他环境不影响存活环境。
+- 真实 RLlib 采样进程使用 4 个环境完成 PPO 更新；旧版 checkpoint 恢复时权重、优化器状态一致，续训后优化器步数继续增长。
+- 两个评测入口正常加载旧版/新版实验，实际切换为 3 / 20 个机器人，并导出指标 JSON。
+- `step_time=0.1 / 0.2` 的位移尺度、停止、到达、机器人碰撞与障碍物碰撞。
+
+配对固定动作回放结果如下，均为单线程 CPU、Ray 2.51.1、200 束 LiDAR；每种规模 2 组任务，每组预热 4 步、计时 12 步，表中是两组平均耗时的中位数：
+
+| 完整采样计算回放 | 旧自定义 IR-SIM 2.7.5 | 新 IR-SIM 2.12.1 fast | 加速 |
+| --- | --- | --- | --- |
+| 10 个机器人 | 296.9 ms/世界步 | 85.0 ms/世界步 | 3.49 倍 |
+| 20 个机器人 | 590.9 ms/世界步 | 171.3 ms/世界步 | 3.45 倍 |
+
+所有计时步处理全部机器人，包含真实冻结策略前向、仿真、LiDAR、规划场和 UDF，不包含 PPO 更新或 Ray 通信。在这些配对轨迹上，位置、观测、策略输出、奖励和终止标记完全一致，测距误差小于 `1.4e-14 m`。这不能直接推算整轮训练或 GPU 吞吐量的加速，也不代表重跑了完整 200 轮收敛实验。
+
+## 10. 新仿真器如何兼容原模型
+
+旧分支的动作实际是已经乘过 `dt` 的世界坐标位移；新版默认接收速度。当前通过官方 `step_mode: external` 写入同样的位移，再由新版同步几何、传感器、碰撞和时间，避免动作被重复乘以 `dt`。
+
+项目内 `env/sim/irsim_interface.py` 保留原任务采样所需的几何和起终点间距约束，采样只读取本环境对象和独立 RNG。策略点云仍按旧版的角度增量构造，实际射线和测距使用新版加速实现。这样保留 PGRL 的模型结构与输入接口，可以继续使用原规划器权重及兼容的策略 checkpoint。
+
+当前任务沿用 `omni`、`circle` 和原碰撞判定。external 模式由项目负责运动更新；它不执行新版 `contact` 刚体动力学，也不自动推进配置中的自主运动障碍物。

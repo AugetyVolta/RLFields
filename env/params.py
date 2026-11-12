@@ -228,7 +228,7 @@ class SceneConfig:
         if dt <= 0 or sample_time < dt or not math.isclose(sample_time / dt, round(sample_time / dt)):
             raise ValueError('step_time must be positive; sample_time must be a positive integer multiple of step_time.')
         sample_time = dt * round(sample_time / dt)
-        world.update(step_time=dt, sample_time=sample_time, collision_mode=self.scene_params.collision_mode)
+        world.update(step_time=dt, sample_time=sample_time, collision_mode=self.scene_params.collision_mode, step_mode='external')
         robots = data['robot']
         robots = [robots] if isinstance(robots, dict) else robots
         if len(robots) != 1:
@@ -251,7 +251,7 @@ class SceneConfig:
             width=world['width'], height=world['height'], offset=world.get('offset', [0, 0]),
             obstacle_entries_including_boundary=len(data.get('obstacle', [])),
             kinematics='omni', shape='circle', move_single_step=dt,
-            step_time=dt, sample_time=sample_time)
+            step_time=dt, sample_time=sample_time, step_mode='external')
         return data
 
     def to_dict(self):

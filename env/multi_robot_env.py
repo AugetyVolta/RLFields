@@ -53,6 +53,8 @@ class MultiRobotEnv(MultiAgentEnv):
 
     # ------- RLlib 接口：reset -------
     def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            self.sim.env.set_random_seed(seed)
         obs_dict, info_dict = self.sim.reset()
         return obs_dict, info_dict
 
@@ -60,3 +62,6 @@ class MultiRobotEnv(MultiAgentEnv):
     def step(self, action_dict):
         obs, rewards, terminateds, truncateds, infos = self.sim.step(action_dict)
         return obs, rewards, terminateds, truncateds, infos
+
+    def close(self):
+        self.sim.env.close(ending_time=0)
