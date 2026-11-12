@@ -11,7 +11,6 @@ from env.params import SceneConfig
 
 def build_ppo_config_multiagent(cfg: SceneConfig):
     ModelCatalog.register_custom_model("rlfields_actor", RLFieldsActorModel)
-    ModelCatalog.register_custom_model("rlfields_actor_prior", RLFieldsActorModel)
 
     config = (
         PPOConfig()
@@ -81,35 +80,53 @@ def step_compat(env, action_dict):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--log-dir", "--log_dir", required=True, help="训练实验目录")
+    parser.add_argument("--iter", type=int, required=True, help="保存的 checkpoint 轮次")
+    parser.add_argument("--num-robots", "--num_robots", type=int, default=None, help="评测机器人数量；默认沿用训练配置")
+    parser.add_argument("--episodes", type=int, default=2)
+    parser.add_argument("--max-steps", "--max_steps", type=int, default=5000)
+    parser.add_argument("--cpus", type=int, default=8)
     parser.add_argument("--render", action="store_true")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    ckpt_path = os.path.abspath(os.path.expanduser(args.ckpt))
-
-    ray.init(log_to_driver=False, ignore_reinit_error=True)
+    if min(args.iter, args.episodes, args.max_steps, args.cpus) < 1 or (args.num_robots is not None and args.num_robots < 1):
+        parser.error("iter、episodes、max-steps、cpus 和指定的 num-robots 必须为正整数。")
+    args.log_dir = os.path.abspath(os.path.expanduser(args.log_dir))
+    ckpt_path = os.path.join(args.log_dir, 'ckpts', f'iter_{args.iter:06d}')
 
     cfg = SceneConfig.from_checkpoint(ckpt_path)
+    trained_num_robots = cfg.robot_params.number_robots
+    if args.num_robots is not None:
+        cfg.robot_params.number_robots = args.num_robots
     cfg.experiment_params.disable_plotting = not args.render
     cfg.network_params.device = args.device
+    ray.init(num_cpus=args.cpus, log_to_driver=False, ignore_reinit_error=True)
     config = build_ppo_config_multiagent(cfg)
 
     config = (
         config
         .env_runners(num_env_runners=0,
                      num_envs_per_env_runner=1,
-                     num_cpus_per_env_runner=20)
+                     num_cpus_per_env_runner=args.cpus)
     )
 
-    config = config.resources(num_gpus=1 if args.device == "cuda" else 0)
+    config = config.resources(num_gpus=1 if args.device == "cuda" else 0, num_cpus_for_main_process=args.cpus)
     algo = config.build()
     algo.restore(ckpt_path)
+    if algo.iteration != args.iter:
+        actual_iteration = algo.iteration
+        algo.stop()
+        ray.shutdown()
+        raise ValueError(f'Checkpoint iteration {actual_iteration} does not match --iter {args.iter}.')
 
     env = algo.env_runner.env
     policy = algo.get_policy("shared_policy")
+    policy.config['env_config'] = cfg.get_env_config()
+    policy.config['model']['custom_model_config'] = cfg.get_network_config()
 
-    episodes = 2
-    max_steps = 5000
+    episodes = args.episodes
+    max_steps = args.max_steps
+    print(f"[infer] log_dir={args.log_dir} iter={algo.iteration} robots={env.num_robots} trained_robots={trained_num_robots} episodes={episodes} max_steps={max_steps}")
 
     for ep in range(episodes):
         obs, info = reset_compat(env)
@@ -155,3 +172,6 @@ if __name__ == "__main__":
             f"[infer] ep={ep} return={ep_ret:.3f} "
             f"terminated={len(term_agents)} truncated={len(trunc_agents)} active={still_active}"
         )
+
+    algo.stop()
+    ray.shutdown()

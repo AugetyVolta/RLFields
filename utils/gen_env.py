@@ -1,6 +1,6 @@
 import random
 import numpy as np
-from env.params import SceneConfig
+from env.params import SceneConfig, MapGenerationParameters
 from .utils import save_to_yaml, export_obstacles_to_obj_trimesh
 
 def circle_to_circle_distance(center1, radius1, center2, radius2) -> float:
@@ -201,21 +201,23 @@ def generate_obstacles(env_width, env_height, min_distance, num_obstacles, circl
     return obstacles
 
 # 生成随机环境配置
-def generate_random_scene(cfg : SceneConfig = SceneConfig()):
+def generate_random_scene(cfg : SceneConfig = None, map_cfg : MapGenerationParameters = None):
+    cfg = SceneConfig() if cfg is None else cfg
+    map_cfg = cfg.map_generation_params if map_cfg is None else map_cfg
 
     env_config = {
         'world': {
-            'width': cfg.scene_params.width,
-            'height': cfg.scene_params.height,
-            'offset': [-cfg.scene_params.width / 2, -cfg.scene_params.height / 2],
+            'width': map_cfg.width,
+            'height': map_cfg.height,
+            'offset': [-map_cfg.width / 2, -map_cfg.height / 2],
             'step_time': cfg.scene_params.step_time,
-            'sample_time': cfg.scene_params.sample_time,
+            'sample_time': cfg.scene_params.step_time if cfg.scene_params.sample_time is None else cfg.scene_params.sample_time,
             'collision_mode': cfg.scene_params.collision_mode,
         },
         'robot': [{
             'number': cfg.robot_params.number_robots,
-            'kinematics': {'name': cfg.robot_params.kinematics},
-            'shape': {'name': cfg.robot_params.shape, 'radius': cfg.robot_params.radius},
+            'kinematics': {'name': 'omni'},
+            'shape': {'name': 'circle', 'radius': cfg.robot_params.radius},
             'vel_min': [-1.0, -1.0],
             'vel_max': [1.0, 1.0],
             'color': ['royalblue', 'red', 'green', 'orange', 'purple', 'yellow', 'cyan', 'magenta', 'lime', 'pink'],
@@ -231,10 +233,10 @@ def generate_random_scene(cfg : SceneConfig = SceneConfig()):
             }],
             'plot': {'show_trajectory': False}
         }],
-        'obstacle': generate_obstacles(cfg.scene_params.width, cfg.scene_params.height,
-                                        cfg.scene_params.min_distance_betw_obs, cfg.scene_params.number_obstacles,
-                                        [cfg.scene_params.circle_radius_min, cfg.scene_params.circle_radius_max],
-                                        [cfg.scene_params.rect_edge_min, cfg.scene_params.rect_edge_max])
+        'obstacle': generate_obstacles(map_cfg.width, map_cfg.height,
+                                        map_cfg.min_distance_betw_obs, map_cfg.number_obstacles,
+                                        [map_cfg.circle_radius_min, map_cfg.circle_radius_max],
+                                        [map_cfg.rect_edge_min, map_cfg.rect_edge_max])
     }
 
     return env_config

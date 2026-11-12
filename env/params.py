@@ -4,8 +4,7 @@ import yaml
 import os
 from pathlib import Path
 import pickle
-import sys
-import types
+import math
 
 @dataclass
 class ESDF_Cfg:
@@ -25,11 +24,15 @@ class ESDF_Cfg:
 
 @dataclass
 class SceneParameters:
+    step_time: float = 0.1
+    sample_time: float | None = None    # None 表示跟随 step_time。
+    collision_mode: str = 'stop'
+
+@dataclass
+class MapGenerationParameters:
+    # 仅用于生成新地图，不覆盖已选地图的尺寸和障碍物布局。
     width: float = 16
     height: float = 16
-    step_time: float = 0.1
-    sample_time: float = 0.1
-    collision_mode: str = 'stop'
 
     number_obstacles: int = 13
     min_distance_betw_obs: float = 1.5
@@ -43,8 +46,6 @@ class SceneParameters:
 @dataclass
 class RobotParameters:
     number_robots: int = 10
-    kinematics: str = 'omni'
-    shape: str = 'circle'
     radius: float = 0.1
     goal_threshold: float = 0.3       # 判断到达目标的距离阈值,世界坐标系下的尺度,不是归一化后的
 
@@ -54,7 +55,8 @@ class RobotParameters:
     lidar_number: int = 200
 
     single_max_timestep: int = 500   # 每个机器人单次任务的最大时间步数, 最大500步
-    move_single_step: float = 0.1    # 单位速度1,单位时间，每个时间步机器人的最大移动距离, 和dt保持一致，1*dt
+    # 单位速度1,单位时间，每个时间步机器人的最大移动距离, 和dt保持一致，1*dt
+    # 位移尺度直接使用 scene_params.step_time，不再单独配置。
     v_max: float = 1.5               # 机器人的最大速度
 
 @dataclass
@@ -85,7 +87,6 @@ class RLFieldsConfig:
     nt_basic_block: str = "resnet"
     nt_use_unet: bool = False
     nt_symm_op_type: str = "min_max"
-    nt_pretrained_path: str = 'ckpt.pt'
     device: str = "cuda"
 
 @dataclass
@@ -112,7 +113,7 @@ class RewardConfig:
     w_speed_danger: float = 0.20
 
     # -------- 先验方向对齐 --------
-    w_prior_align: float = 0.03
+    w_heading: float = 0.03
     align_speed_power: float = 2.0
 
     # -------- 终止项 --------
@@ -137,11 +138,7 @@ class RewardConfig:
 
 @dataclass
 class ExprimentConfig:
-    exp_dir: str = None
-    env_yaml_path: str = 'config/random_env.yaml'
     disable_plotting: bool = False
-    ckpt_save_interval: int = 10
-    restore_ckpt_path: str = None
     max_iters: int = 200
 
     num_env_runners: int = 2
@@ -173,6 +170,7 @@ class AlgorithmConfig:
 @dataclass
 class SceneConfig:
     scene_params: SceneParameters = field(default_factory=SceneParameters)
+    map_generation_params: MapGenerationParameters = field(default_factory=MapGenerationParameters)
     robot_params: RobotParameters = field(default_factory=RobotParameters)
     esdf_params : ESDF_Cfg = field(default_factory=ESDF_Cfg)
     network_params : RLFieldsConfig = field(default_factory=RLFieldsConfig)
@@ -180,8 +178,113 @@ class SceneConfig:
     experiment_params : ExprimentConfig = field(default_factory=ExprimentConfig)
     algorithm_params : AlgorithmConfig = field(default_factory=AlgorithmConfig)
 
+    def __post_init__(self):
+        # 以下是自动解析的运行信息，不是需要手动修改的训练参数。
+        self.experiment_params.exp_dir = None
+        self.experiment_params.env_yaml_path = None
+        self.experiment_params.restore_ckpt_path = None
+        self.experiment_params.config_overrides = {}
+        self.network_params.nt_pretrained_path = None
+        self._environment_info = {}
+
+    def select_environment(self, name: str):
+        # 一个环境目录同时提供地图和 PC-Planner 权重，避免切地图时漏换权重。
+        root = Path(__file__).resolve().parents[1]
+        directory = root / 'config' / name
+        if not directory.is_dir():
+            raise FileNotFoundError(f'--env must name a folder under config: {directory}')
+        env_files = []
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.suffix.lower() in ('.yaml', '.yml'):
+                with path.open(encoding='utf-8') as f:
+                    data = yaml.safe_load(f)
+                if isinstance(data, dict) and 'world' in data and 'robot' in data:
+                    env_files.append(path)
+        planner_files = sorted(p for p in directory.iterdir()
+                               if p.is_file() and p.suffix.lower() in ('.pt', '.pth', '.ckpt'))
+        if len(env_files) != 1:
+            raise ValueError(f'Expected one environment YAML in {directory}; found {[p.name for p in env_files]}')
+        if len(planner_files) != 1:
+            raise ValueError(f'Expected one PC-Planner weight file in {directory}; found {[p.name for p in planner_files]}')
+        env_path, planner_path = env_files[0], planner_files[0]
+        self.experiment_params.env_yaml_path = str(env_path.resolve())
+        self.network_params.nt_pretrained_path = str(planner_path.resolve())
+        self._environment_info = {'name': directory.name, 'source_yaml': str(env_path.resolve()),
+                                  'source_planner': str(planner_path.resolve())}
+        self.get_simulation_config()
+
+    def get_simulation_config(self, world_file=None):
+        # 地图只提供固定几何；机器人和仿真时间统一由 params 覆盖。
+        path = world_file or self.experiment_params.env_yaml_path
+        if not path:
+            raise ValueError('No environment selected; specify --env or restore a checkpoint.')
+        path = Path(path).expanduser().resolve()
+        with path.open(encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        world = data['world']
+        dt = self.scene_params.step_time
+        sample_time = self.scene_params.sample_time
+        sample_time = dt if sample_time is None else sample_time
+        if dt <= 0 or sample_time < dt or not math.isclose(sample_time / dt, round(sample_time / dt)):
+            raise ValueError('step_time must be positive; sample_time must be a positive integer multiple of step_time.')
+        sample_time = dt * round(sample_time / dt)
+        world.update(step_time=dt, sample_time=sample_time, collision_mode=self.scene_params.collision_mode)
+        robots = data['robot']
+        robots = [robots] if isinstance(robots, dict) else robots
+        if len(robots) != 1:
+            raise ValueError('Expected one homogeneous robot group in the selected environment.')
+        robot = robots[0]
+        cfg = self.robot_params
+        robot.update(number=cfg.number_robots, kinematics={'name': 'omni'},
+                     shape={'name': 'circle', 'radius': cfg.radius}, goal_threshold=cfg.goal_threshold)
+        sensors = robot.get('sensors', [])
+        lidars = [s for s in sensors if s.get('type') == 'lidar2d']
+        if not lidars:
+            lidars = [{'type': 'lidar2d'}]
+            sensors.extend(lidars)
+        for lidar in lidars:
+            lidar.update(range_min=cfg.lidar_range_min, range_max=cfg.lidar_range_max,
+                         angle_range=cfg.lidar_angle_range, number=cfg.lidar_number)
+        robot['sensors'] = sensors
+        data['robot'] = [robot]
+        self._environment_info.update(
+            width=world['width'], height=world['height'], offset=world.get('offset', [0, 0]),
+            obstacle_entries_including_boundary=len(data.get('obstacle', [])),
+            kinematics='omni', shape='circle', move_single_step=dt,
+            step_time=dt, sample_time=sample_time)
+        return data
+
+    def to_dict(self):
+        data = asdict(self)
+        data['experiment_params'].update(exp_dir=self.experiment_params.exp_dir,
+            env_yaml_path=self.experiment_params.env_yaml_path,
+            restore_ckpt_path=self.experiment_params.restore_ckpt_path,
+            config_overrides=self.experiment_params.config_overrides)
+        data['network_params']['nt_pretrained_path'] = self.network_params.nt_pretrained_path
+        data['environment_info'] = dict(self._environment_info)
+        return data
+
+    def apply_overrides(self, overrides):
+        # 只覆盖显式写出的可调字段，其余参数保持 checkpoint/原配置的值。
+        if not isinstance(overrides, dict):
+            raise ValueError('Override config must be a mapping of parameter sections.')
+        sections = {item.name: getattr(self, item.name) for item in fields(self)}
+        changes = []
+        for name, values in overrides.items():
+            if name not in sections or not isinstance(values, dict):
+                raise ValueError(f'Unknown or invalid config section: {name}')
+            keys = {item.name for item in fields(sections[name])}
+            for key, value in values.items():
+                if key not in keys:
+                    raise ValueError(f'Unknown or derived config field: {name}.{key}')
+                changes.append((sections[name], key, value))
+        for section, key, value in changes:
+            setattr(section, key, value)
+        self.esdf_params.resolution = (self.esdf_params.x_max - self.esdf_params.x_min) / self.esdf_params.map_size
+
     def get_env_config(self) -> Dict[str, Any]:
         """給 env_config."""
+        self.get_simulation_config()
         return {
             "self_obs_dim": self.network_params.self_obs_dim,
             "neighbor_obs_dim": self.network_params.neighbor_obs_dim,
@@ -191,7 +294,7 @@ class SceneConfig:
             "action_dim": self.network_params.nt_dim,
             "env_yaml_path": self.experiment_params.env_yaml_path,
             "disable_plotting": self.experiment_params.disable_plotting,
-            "scene_config": asdict(self)
+            "scene_config": self.to_dict()
         }
 
     def get_network_config(self) -> Dict[str, Any]:
@@ -230,7 +333,9 @@ class SceneConfig:
         导出当前 SceneConfig 的所有参数（包含嵌套 dataclass）到给定路径。
         默认写成 YAML 文件。
         """
-        data = asdict(self)  # 递归展开所有 dataclass -> dict
+        if self.experiment_params.env_yaml_path and Path(self.experiment_params.env_yaml_path).expanduser().is_file():
+            self.get_simulation_config()
+        data = self.to_dict()  # 递归展开所有 dataclass -> dict
 
         # 确保目录存在
         dir_name = os.path.dirname(path)
@@ -249,53 +354,46 @@ class SceneConfig:
             for key, value in data.get(item.name, {}).items():
                 if hasattr(section, key):
                     setattr(section, key, value)
+        cfg._environment_info = dict(data.get('environment_info', {}))
         cfg.esdf_params.resolution = (cfg.esdf_params.x_max - cfg.esdf_params.x_min) / cfg.esdf_params.map_size
         return cfg
 
     @classmethod
     def from_checkpoint(cls, ckpt_path):
-        # 评测/续训读取保存时的结构，不需要手动切换 prior_align 或增强开关。
+        # 评测/续训读取保存时的结构，不需要手动切换模型或增强开关。
         path = Path(ckpt_path).expanduser().resolve()
         policy_file = path / 'policies/shared_policy/policy_state.pkl'
         if not policy_file.is_file():
             policy_file = path / 'policy_state.pkl'
         if not policy_file.is_file():
             raise FileNotFoundError(f'No shared_policy checkpoint in {path}')
-        # 历史 checkpoint 中的旧类路径只在内存中映射，不保留重复实现文件。
-        from .multi_robot_env import MultiRobotEnv
-        from .sim.marl_sim_env import MARL_SIM
-        from model.models import RLFields
-        from model.policy_value_network import RLFieldsActorModel
-        for module_name, class_name, target in [
-            ("env.multi_robot_env_prior_align", "MultiRobotEnvPriorAlign", MultiRobotEnv),
-            ("env.sim.marl_sim_env_prior_align", "MARL_SIM_PriorAlign", MARL_SIM),
-            ("model.models_prior_align", "RLFieldsPriorAlign", RLFields),
-            ("model.policy_value_network_prior_align", "RLFieldsActorModelPriorAlign", RLFieldsActorModel),
-        ]:
-            module = types.ModuleType(module_name)
-            setattr(module, class_name, target)
-            sys.modules.setdefault(module_name, module)
         with policy_file.open('rb') as f:
             state = pickle.load(f)
         policy_cfg = state['policy_spec']['config']
-        cfg = cls.from_dict(policy_cfg.get("env_config", {}).get("scene_config", {}))
+        saved_scene_config = policy_cfg.get("env_config", {}).get("scene_config", {})
+        cfg = cls.from_dict(saved_scene_config)
         run_dir = None
         for parent in path.parents:
             snapshot = parent / 'scene_config.yaml'
             if not snapshot.is_file():
                 snapshot = parent / 'scene_config_resume.yaml'
             if snapshot.is_file():
-                with snapshot.open(encoding='utf-8') as f:
-                    cfg = cls.from_dict(yaml.safe_load(f) or {})
+                if not saved_scene_config:
+                    with snapshot.open(encoding='utf-8') as f:
+                        cfg = cls.from_dict(yaml.safe_load(f) or {})
                 run_dir = parent
                 break
+        for item in fields(cfg.algorithm_params):
+            key = 'lambda' if item.name == 'lambda_' else item.name
+            if key in policy_cfg:
+                setattr(cfg.algorithm_params, item.name, policy_cfg[key])
         model_cfg = policy_cfg['model'].get('custom_model_config', {})
         for key, value in model_cfg.items():
             if hasattr(cfg.network_params, key):
                 setattr(cfg.network_params, key, value)
         weights = state['weights']
         if 'fused_ln.weight' not in weights:
-            raise ValueError('This checkpoint uses non-aligned observations; use a prior_align checkpoint.')
+            raise ValueError('Checkpoint architecture is incompatible with the current policy model.')
         cfg.network_params.use_sdf_grad = weights['rlfields.env_encoder.obstacle_encoder.feature_extractor.0.weight'].shape[1] == 3
         cfg.network_params.use_ctx_ffn = any('.ctx_ffn.' in key for key in weights)
         cfg.network_params.use_neigh_self_attn = any('.neigh_self_attn.' in key for key in weights)
@@ -306,14 +404,17 @@ class SceneConfig:
         cfg.esdf_params.resolution = (cfg.esdf_params.x_max - cfg.esdf_params.x_min) / cfg.esdf_params.map_size
         cfg.experiment_params.env_yaml_path = env_cfg.get('env_yaml_path', cfg.experiment_params.env_yaml_path)
         root = Path(__file__).resolve().parents[1]
-        for section, key, archive, default in [
-            (cfg.experiment_params, 'env_yaml_path', 'env.yaml', root / 'config/random_env.yaml'),
-            (cfg.network_params, 'nt_pretrained_path', 'ntfields.pt', root / 'ckpt.pt'),
+        for section, key, archive in [
+            (cfg.experiment_params, 'env_yaml_path', 'env.yaml'),
+            (cfg.network_params, 'nt_pretrained_path', 'ntfields.pt'),
         ]:
-            value = Path(getattr(section, key)).expanduser()
-            candidates = ([run_dir / archive] if run_dir else []) + [value, root / value, default]
+            value = getattr(section, key)
+            candidates = [run_dir / archive] if run_dir else []
+            if value:
+                value = Path(value).expanduser()
+                candidates += [value, root / value]
             selected = next((p for p in candidates if p.is_file()), None)
             if selected is None:
-                raise FileNotFoundError(f'Missing {key}: {default}')
+                raise FileNotFoundError(f'Missing checkpoint asset {key}: {value}')
             setattr(section, key, str(selected.resolve()))
         return cfg

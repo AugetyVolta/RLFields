@@ -619,7 +619,7 @@ class LateFusionHead(nn.Module):
 
 class RLFields(nn.Module):
     """
-    RLFields with goal_rel rotated into prior-aligned coordinate frame.
+    RLFields with goal_rel expressed in the local navigation frame.
     - Keeps NTFields branch in world coordinates (self_obs unchanged).
     - Only rotates goal_rel for EnvEncoder input, so local features align with prior.
     """
@@ -795,7 +795,7 @@ class RLFields(nn.Module):
         assert H * H == sdf_len, f"sdf_input 展平长度 {sdf_len} 不能组成正方形图像"
         sdf_input = sdf_flat.view(B, 1, H, H)                    # [B, 1, H, H]
 
-        # -------- prior-aligned goal_rel（只给 EnvEncoder） --------
+        # -------- 局部坐标系中的 goal_rel（只给 EnvEncoder） --------
         half_dim = self.self_obs_dim // 2
         start = self_obs[:, :half_dim]
         goal = self_obs[:, half_dim:]

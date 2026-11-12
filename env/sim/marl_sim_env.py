@@ -2,6 +2,8 @@ import irsim
 import math
 import numpy as np
 import torch
+import tempfile
+import yaml
 
 from model.models import NN
 from .esdf_2d_simple import ESDF_2d
@@ -11,22 +13,26 @@ from .sim_env import SIM_ENV
 
 class MARL_SIM(SIM_ENV):
     """
-    Prior-aligned variant:
+    Local navigation observations:
     - Lidar pointcloud rotated so prior_dir becomes +x axis.
-    - Neighbor relative positions/goals rotated to the same prior-aligned frame.
+    - Neighbor relative positions/goals rotated to the same local frame.
     - self_obs absolute coords and prior_dir itself are kept unchanged.
     """
     def __init__(
         self,
-        world_file="config/random_env.yaml",
+        world_file=None,
         disable_plotting=False,
         scene_cfg = None
     ):
         scene_cfg = SceneConfig() if scene_cfg is None else scene_cfg
         self.render = False if disable_plotting else True
-        self.env = irsim.make(
-            world_file, disable_all_plot=disable_plotting, display=self.render
-        )
+        env_config = scene_cfg.get_simulation_config(world_file)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', encoding='utf-8') as f:
+            yaml.safe_dump(env_config, f, allow_unicode=True, sort_keys=False)
+            f.flush()
+            self.env = irsim.make(
+                f.name, disable_all_plot=disable_plotting, display=self.render
+            )
         self.num_robots = len(self.env.robot_list)
         self.robot_list = self.env.robot_list
         self.obstacle_list = self.env.obstacle_list
@@ -53,7 +59,7 @@ class MARL_SIM(SIM_ENV):
         self.goal_threshold = scene_cfg.robot_params.goal_threshold
 
         self.single_max_timestep = scene_cfg.robot_params.single_max_timestep 
-        self.move_single_step = scene_cfg.robot_params.move_single_step  
+        self.move_single_step = scene_cfg.scene_params.step_time
         self.v_max = scene_cfg.robot_params.v_max
 
         # reward 配置
@@ -204,7 +210,7 @@ class MARL_SIM(SIM_ENV):
             return np.eye(2, dtype=np.float32)
         c = px / n
         s = py / n
-        # rotate world vectors into prior-aligned frame (prior -> +x)
+        # rotate world vectors into the local frame (guidance direction -> +x)
         return np.array([[c, s], [-s, c]], dtype=np.float32)
 
 
@@ -237,7 +243,7 @@ class MARL_SIM(SIM_ENV):
         robot_goal_norm = (robot_goal - self.world_center) / self.world_scale
 
         self_obs = np.concatenate([robot_pos_norm, robot_goal_norm], axis=0)  # (self.self_obs_dim,)        
-        # prior-aligned rotation：局部几何和邻居统一到先验方向坐标系。
+        # 局部坐标变换：局部几何和邻居统一到先验方向坐标系。
         R = self._rot_from_prior(self.robot_last_prior_dir[id])
         # ===== 2) neighbor_obs: 以当前机器人为中心的邻居 [rel_x, rel_y, rel_goal_x, rel_goal_y] =====
         neighbor_feats = []
@@ -255,7 +261,7 @@ class MARL_SIM(SIM_ENV):
                 # 这里用“相对于当前机器人位置”的相对坐标, 同时进行缩放
                 rel_pos = other_pos - robot_pos
                 rel_goal = other_goal - robot_pos
-                # rotate to prior-aligned frame
+                # rotate to the local frame
                 rel_pos = self._rot_vecs(rel_pos.reshape(1, 2), R)[0]
                 rel_goal = self._rot_vecs(rel_goal.reshape(1, 2), R)[0]
                 rel_pos_norm = rel_pos / self.world_scale
@@ -664,7 +670,7 @@ class MARL_SIM(SIM_ENV):
         w_speed_safe   = cfg.w_speed_safe
         w_speed_danger = cfg.w_speed_danger
 
-        w_prior_align  = cfg.w_prior_align
+        w_heading  = cfg.w_heading
 
         bonus_arrive           = cfg.bonus_arrive
         pen_timeout            = cfg.pen_timeout
@@ -762,15 +768,15 @@ class MARL_SIM(SIM_ENV):
         reward += r_speed
 
         # (f) 先验方向对齐（安全区更强）
-        r_prior_align = 0.0
+        r_heading = 0.0
         align_gate = progress_gate * (speed_norm ** cfg.align_speed_power)
         pn = float(np.linalg.norm(prior_dir_prev))
         if pn > 1e-6 and speed > 1e-4:
             prior_unit = (prior_dir_prev / pn).astype(np.float32).reshape(-1)
             cos_theta = float(np.dot(cur_dir, prior_unit))
             cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
-            r_prior_align = w_prior_align * cos_theta
-            reward += r_prior_align * align_gate
+            r_heading = w_heading * cos_theta
+            reward += r_heading * align_gate
 
         # (g) 终止项
         r_arrive  = bonus_arrive if is_arrive else 0.0
@@ -803,8 +809,8 @@ class MARL_SIM(SIM_ENV):
             "r_obst_delta":    float(r_obst_delta),
             "r_obst_static":   float(r_obst_static),
             "r_speed":         float(r_speed),
-            "r_prior_align_raw": float(r_prior_align),
-            "r_prior_align":   float(r_prior_align * align_gate),
+            "r_heading_raw":   float(r_heading),
+            "r_heading":       float(r_heading * align_gate),
             "r_arrive":        float(r_arrive),
             "r_timeout":       float(r_timeout),
             "r_coll_robot":    float(r_coll_robot),

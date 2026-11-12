@@ -1,0 +1,99 @@
+world:
+  width: 16
+  height: 16
+  offset: [-8.0, -8.0]
+  step_time: 0.1
+  sample_time: 0.1
+  collision_mode: stop
+robot:
+- number: 10
+  kinematics:
+    name: omni
+  shape:
+    name: circle
+    radius: 0.1
+  vel_min: [-1.0, -1.0]
+  vel_max: [1.0, 1.0]
+  color: [royalblue, red, green, orange, purple, yellow, cyan, magenta, lime, pink]
+  arrive_mode: position
+  goal_threshold: 0.3
+  sensors:
+  - type: lidar2d
+    range_min: 0.0
+    range_max: 6.0
+    angle_range: 6.28
+    number: 200
+    alpha: 0.0
+  plot:
+    show_trajectory: false
+obstacle:
+- shape:
+    name: rectangle
+    length: 1.3829817896683236
+    width: 1.2260450537993486
+  state: [-0.3080685580245559, -1.7383758336777015, 0.0]
+- shape:
+    name: circle
+    radius: 0.4231195248831472
+  state: [-3.8478207197673515, -0.3566680210065094, 0.0]
+- shape:
+    name: rectangle
+    length: 1.2805051824912763
+    width: 0.6854261101143526
+  state: [4.918840675308138, 2.5426077210276317, 0.0]
+- shape:
+    name: rectangle
+    length: 0.5055998053268738
+    width: 1.1612701330130448
+  state: [-5.888850349671948, 2.0370461691788435, 0.0]
+- shape:
+    name: rectangle
+    length: 1.1902130665258892
+    width: 1.6710514281461764
+  state: [-1.0406094813958902, 5.679821593756676, 0.0]
+- shape:
+    name: rectangle
+    length: 1.7831062019705664
+    width: 1.9265919066165405
+  state: [5.146172565967483, -2.932886266904955, 0.0]
+- shape:
+    name: rectangle
+    length: 1.2161198594666751
+    width: 1.5326047990796747
+  state: [2.5958310831762983, 5.002693250528975, 0.0]
+- shape:
+    name: circle
+    radius: 0.5566834160782019
+  state: [2.059408104302169, -5.793632882862859, 0.0]
+- shape:
+    name: circle
+    radius: 0.5595624207632084
+  state: [1.987464492840969, 0.3976986850373887, 0.0]
+- shape:
+    name: circle
+    radius: 1.0838121714936384
+  state: [-4.25352415809053, -5.324923783976234, 0.0]
+- shape:
+    name: circle
+    radius: 1.160294264112864
+  state: [-0.7227685033266189, 2.20434629739049, 0.0]
+- shape:
+    name: rectangle
+    length: 1.3758244668671158
+    width: 1.6352823418116076
+  state: [-5.335162826628697, 4.735925070118727, 0.0]
+- shape:
+    name: circle
+    radius: 0.5875615435863597
+  state: [-1.0189491686960581, -5.59307603300181, 0.0]
+- shape:
+    name: linestring
+    vertices:
+    - [-8.0, -8.0]
+    - [8.0, -8.0]
+    - [8.0, 8.0]
+    - [-8.0, 8.0]
+    - [-8.0, -8.0]
+  kinematics:
+    name: static
+  state: [0, 0, 0]

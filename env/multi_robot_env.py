@@ -12,7 +12,7 @@ class MultiRobotEnv(MultiAgentEnv):
         self.num_use_neighbor_obs = config.get("num_use_neighbor_obs", 6)
         self.H = config.get("H", 80)
         self.num_robots = config.get("num_robots", 4)
-        self.env_yaml_path = config.get("env_yaml_path", 'config/random_env.yaml')
+        self.env_yaml_path = config["env_yaml_path"]
         self.disable_plotting = config.get("disable_plotting", False)
         
         # action dim
