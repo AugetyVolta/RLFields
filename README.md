@@ -1,10 +1,22 @@
-# PGRL-Nav
+<div align="center">
 
-**Prior-Guided Residual Reinforcement Learning for Decentralized Multi-Robot Navigation**
+<h1>PGRL-Nav: Prior-Guided Residual Reinforcement Learning<br>for Decentralized Multi-Robot Navigation</h1>
 
-Boyang Zhou, Ziyang Zhang, Haocheng Peng, Yujun Shen, Hujun Bao, Zhaopeng Cui
+<p>
+  Boyang Zhou &nbsp;&middot;&nbsp; Ziyang Zhang &nbsp;&middot;&nbsp; Haocheng Peng<br>
+  Yujun Shen &nbsp;&middot;&nbsp; Hujun Bao &nbsp;&middot;&nbsp; Zhaopeng Cui
+</p>
 
-**IROS 2026**
+<p><strong>IROS 2026</strong></p>
+
+<p>
+  <a href="#installation">Installation</a> &nbsp;|&nbsp;
+  <a href="#training">Training</a> &nbsp;|&nbsp;
+  <a href="#evaluation">Evaluation</a> &nbsp;|&nbsp;
+  <a href="#citation">Citation</a>
+</p>
+
+</div>
 
 PGRL-Nav separates geometry-aware global guidance from interaction-aware local control. A frozen neural time-to-arrival field supplies obstacle-aware guidance and global features. A shared PPO actor-critic combines this prior with local LiDAR geometry and neighbor observations, then predicts residual controls that adjust speed and heading relative to the guidance direction.
 
