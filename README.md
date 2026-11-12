@@ -3,7 +3,7 @@
 <h1>PGRL-Nav: Prior-Guided Residual Reinforcement Learning<br>for Decentralized Multi-Robot Navigation</h1>
 
 <p>
-  Boyang Zhou &nbsp;&middot;&nbsp; Ziyang Zhang &nbsp;&middot;&nbsp; Haocheng Peng<br>
+  Boyang Zhou &nbsp;&middot;&nbsp; Ziyang Zhang &nbsp;&middot;&nbsp; Haocheng Peng &nbsp;&middot;&nbsp;
   Yujun Shen &nbsp;&middot;&nbsp; Hujun Bao &nbsp;&middot;&nbsp; Zhaopeng Cui
 </p>
 
@@ -31,8 +31,8 @@ This repository provides the navigation model, multi-robot simulation environmen
 The dependency configuration uses Python 3.10, PyTorch 2.5.1 with CUDA 11.8, Ray/RLlib 2.51.1, and IR-SIM 2.12.1.
 
 ```bash
-git clone https://github.com/AugetyVolta/RLFields.git
-cd RLFields
+git clone https://github.com/AugetyVolta/PGRL-Nav.git
+cd PGRL-Nav
 
 conda create -n pgrl python=3.10 -y
 conda activate pgrl
