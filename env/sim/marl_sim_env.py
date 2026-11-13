@@ -95,6 +95,7 @@ class MARL_SIM(SIM_ENV):
         self.robot_last_obst_loss = torch.zeros(self.num_robots, dtype=torch.float32)
 
         self._env_step_id = 0
+        self._planner_cache = None
     # only alive robots have action
     def step(self, action_dict): # action_dict: dict of(robot_id, [alpha, theta]), [-1, 1]
         applied_actions = []
@@ -525,6 +526,33 @@ class MARL_SIM(SIM_ENV):
             else:
                 prior_dir = diff / d
             return d, prior_dir
+
+        # 同一世界状态中的机器人查询相互独立，合批计算并复用结果。
+        positions = np.stack([r.state[:2].ravel() for r in self.robot_list])
+        goals = np.stack([r.goal[:2].ravel() for r in self.robot_list])
+        matches = np.flatnonzero(np.all(positions == pos, axis=1) & np.all(goals == goal, axis=1))
+        if matches.size:
+            key = (positions.tobytes(), goals.tobytes())
+            if self._planner_cache is None or self._planner_cache['key'] != key:
+                p = (positions - self.world_center) / self.world_scale
+                g = (goals - self.world_center) / self.world_scale
+                start = torch.as_tensor(p, dtype=torch.float32, device=self.device)
+                target = torch.as_tensor(g, dtype=torch.float32, device=self.device)
+                coords = torch.cat([start, target], dim=-1)
+                with torch.no_grad():
+                    tau, _ = self.ntfields_nn.out(coords)
+                    delta = target - start
+                    times = torch.sqrt(torch.einsum('ij,ij->i', delta, delta)) / tau[:, 0]
+                grad = self.ntfields_nn.calculate_gradient(coords)[:, :2]
+                norm = grad.norm(dim=-1, keepdim=True)
+                directions = (grad / (norm + 1e-8)).detach().cpu().numpy().astype(np.float32)
+                small = norm.detach().cpu().numpy()[:, 0] < 1e-8
+                if small.any():
+                    delta = (g - p).astype(np.float32)
+                    directions[small] = delta[small] / (np.linalg.norm(delta[small], axis=1, keepdims=True) + 1e-8)
+                self._planner_cache = {'key': key, 'times': times.detach().cpu().numpy(), 'directions': directions}
+            index = matches[0]
+            return float(self._planner_cache['times'][index]), self._planner_cache['directions'][index].copy()
 
         pos_norm  = (pos  - self.world_center) / self.world_scale
         goal_norm = (goal - self.world_center) / self.world_scale

@@ -212,11 +212,11 @@ if __name__ == "__main__":
 
     for it in range(resume_it, cfg.experiment_params.max_iters):
         result = algo.train()
-        print(f"[{exp_info['exp_name']}] iter={it + 1}", result)
 
         iter_ckpt_root = os.path.join(exp_info["ckpt_dir"], f"iter_{it + 1:06d}")
         algo.save(iter_ckpt_root)
-        print(f"Checkpoint saved at {iter_ckpt_root}")
+        print(f"[{exp_info['exp_name']}] iter={it + 1} "
+              f"time={result['time_this_iter_s']:.2f}s checkpoint={iter_ckpt_root}", flush=True)
 
     # save final
     final_root = os.path.join(exp_info["ckpt_dir"], "final")

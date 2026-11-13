@@ -425,7 +425,7 @@ class EnvEncoder(nn.Module):
                 pad_mask = ~neighbor_mask  # True 表示 padding
                 # 无邻居行保留一个零 token，避免 softmax 全屏蔽时反向出现 NaN。
                 pad_mask = pad_mask.clone()
-                pad_mask[pad_mask.all(dim=1), 0] = False
+                pad_mask[:, 0] &= neighbor_mask.any(dim=1)
             attn_out, _ = self.neigh_self_attn(
                 neigh_tokens, neigh_tokens, neigh_tokens,
                 key_padding_mask=pad_mask,
@@ -434,9 +434,7 @@ class EnvEncoder(nn.Module):
             # 如果整行都是 padding，强制置零避免 NaN
             if neighbor_mask is not None:
                 valid = neighbor_mask.any(dim=1)
-                if not valid.all():
-                    attn_out = attn_out.clone()
-                    attn_out[~valid] = 0.0
+                attn_out = attn_out * valid[:, None, None].to(attn_out.dtype)
             neigh_tokens = neigh_tokens + self.neigh_self_alpha * attn_out
             neigh_tokens = self.neigh_self_ln(neigh_tokens)
             neigh_tokens = neigh_tokens * qmask_f.unsqueeze(-1)
