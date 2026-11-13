@@ -1,6 +1,6 @@
 <div align="center">
 
-<h1>PGRL-Nav: Prior-Guided Residual Reinforcement Learning<br>for Decentralized Multi-Robot Navigation</h1>
+<h1>PGRL-Nav: Prior-Guided Residual Reinforcement Learning for Decentralized Multi-Robot Navigation</h1>
 
 <p>
   Boyang Zhou &nbsp;&middot;&nbsp; Ziyang Zhang &nbsp;&middot;&nbsp; Haocheng Peng &nbsp;&middot;&nbsp;
