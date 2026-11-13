@@ -1,5 +1,6 @@
 import os
 import shutil
+import warnings
 import yaml
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -12,6 +13,7 @@ from model.learner_policy import RLFieldsPPOTorchPolicy
 from ray.rllib.policy.policy import PolicySpec
 from ray.rllib.models import ModelCatalog
 from ray.tune.logger import UnifiedLogger
+from ray.util.annotations import RayDeprecationWarning
 from env.multi_robot_env import MultiRobotEnv
 from env.params import SceneConfig
 
@@ -25,7 +27,12 @@ def make_logger_creator(logdir: str):
     """让 RLlib 把 TensorBoard 等日志都写到 logdir 下。"""
     def logger_creator(config):
         # UnifiedLogger 会在 logdir 下直接写 event files
-        return UnifiedLogger(config, logdir, loggers=None)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", category=RayDeprecationWarning,
+                message=r"(?s).*(UnifiedLogger|JsonLogger|CSVLogger|TBXLogger).*",
+            )
+            return UnifiedLogger(config, logdir, loggers=None)
     return logger_creator
 
 def build_ppo_config_multiagent(cfg: SceneConfig):
@@ -121,7 +128,13 @@ def prepare_exp(cfg: SceneConfig, exp_dir=None, resume_in_place=False):
     if os.path.realpath(planner_source) != os.path.realpath(cfg.network_params.nt_pretrained_path):
         shutil.copyfile(planner_source, cfg.network_params.nt_pretrained_path)
     # 初始化 Ray
-    ray.init(log_to_driver=True, logging_level="ERROR")
+    with warnings.catch_warnings():
+        # 保持当前 GPU 可见性行为，只关闭这一条未来版本迁移提示。
+        warnings.filterwarnings(
+            "ignore", category=FutureWarning, module=r"ray\._private\.worker",
+            message=r"Tip: In future versions of Ray, Ray will no longer override accelerator .*",
+        )
+        ray.init(log_to_driver=True, logging_level="ERROR")
     config = build_ppo_config_multiagent(cfg)
     algo = config.build(logger_creator=make_logger_creator(tb_dir))
 

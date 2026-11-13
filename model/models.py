@@ -724,7 +724,7 @@ class RLFields(nn.Module):
         
         # 加载预训练权重
         if nt_pretrained_path is not None:
-            ckpt = torch.load(nt_pretrained_path, map_location=self.device)
+            ckpt = torch.load(nt_pretrained_path, map_location=self.device, weights_only=True)
             self.ntfields_nn.load_state_dict(ckpt["model_state_dict"], strict=True)
         
         # 冻结 NTFields 参数

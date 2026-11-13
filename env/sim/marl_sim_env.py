@@ -86,7 +86,7 @@ class MARL_SIM(SIM_ENV):
                             symm_op_type=scene_cfg.network_params.nt_symm_op_type).to(self.device)
         
         nt_pretrained_path = scene_cfg.network_params.nt_pretrained_path
-        ckpt = torch.load(nt_pretrained_path, map_location=self.device)
+        ckpt = torch.load(nt_pretrained_path, map_location=self.device, weights_only=True)
         self.ntfields_nn.load_state_dict(ckpt["model_state_dict"], strict=True)
 
         self.robot_last_T = torch.zeros(self.num_robots, dtype=torch.float32)
