@@ -78,6 +78,7 @@ Replace `random_env` with another environment directory to select a different ma
 | --- | --- |
 | Training robots | 10 |
 | Training iterations | 200 |
+| Learner GPUs | 1 (configurable with `--num-gpus`) |
 | Robot model | Omnidirectional, circular |
 | Robot radius | 0.1 m |
 | Goal threshold | 0.3 m |
@@ -92,6 +93,7 @@ For an experiment-specific configuration, create an override file containing onl
 
 ```yaml
 experiment_params:
+  num_gpus: 2
   num_env_runners: 2
   num_envs_per_env_runner: 4
 algorithm_params:
@@ -101,6 +103,14 @@ algorithm_params:
 ```bash
 python train.py --env random_env --output-dir logs/pgrl_custom --override-config train_config.yaml
 ```
+
+Use `--num-gpus` to select the learner GPU count, independently of `num_gpus_per_env_runner`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python train.py --env random_env --num-gpus 2
+```
+
+The default remains one learner GPU. `experiment_params.num_gpus` can also be set in `env/params.py` or an override YAML; the command-line value takes precedence, including when resuming. Saved checkpoints retain the effective setting. Increasing the GPU count does not change the configured PPO minibatch size or number of epochs.
 
 Set sampling-worker CPU/GPU allocations in `experiment_params` to fit the machine. Multiple environments within a worker are stepped sequentially, with policy inference batched across agents.
 

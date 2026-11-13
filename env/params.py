@@ -141,6 +141,7 @@ class ExprimentConfig:
     disable_plotting: bool = True
     max_iters: int = 200
 
+    num_gpus: int = 1             # 训练端 GPU 数量，采样 worker 的 GPU 单独配置。
     num_env_runners: int = 2
     num_envs_per_env_runner: int = 1
     num_cpus_per_env_runner: int = 10
@@ -387,6 +388,7 @@ class SceneConfig:
             key = 'lambda' if item.name == 'lambda_' else item.name
             if key in policy_cfg:
                 setattr(cfg.algorithm_params, item.name, policy_cfg[key])
+        cfg.experiment_params.num_gpus = policy_cfg.get('num_gpus', cfg.experiment_params.num_gpus)
         model_cfg = policy_cfg['model'].get('custom_model_config', {})
         for key, value in model_cfg.items():
             if hasattr(cfg.network_params, key):

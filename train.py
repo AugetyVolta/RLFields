@@ -81,7 +81,7 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
             policy_mapping_fn=lambda agent_id, *args, **kwargs: "shared_policy",
         )
         .resources(
-            num_gpus=1,
+            num_gpus=cfg.experiment_params.num_gpus,
             num_cpus_for_main_process=cfg.experiment_params.num_cpus_for_main_process
         )
     )
@@ -141,8 +141,11 @@ if __name__ == "__main__":
     parser.add_argument("--iter", dest="resume_iter", type=int, metavar="N", help="加载已完成第 N 轮的 checkpoint，从 N+1 轮继续")
     parser.add_argument("--output-dir", help="输出实验目录；续训默认写回原实验目录")
     parser.add_argument("--max-iters", type=int, help="训练总轮次上限，不是额外训练轮数")
+    parser.add_argument("--num-gpus", type=int, help="训练端 GPU 数量；覆盖原配置，采样 worker 的 GPU 单独设置")
     parser.add_argument("--override-config", metavar="YAML", help="仅写需要覆盖的训练参数；续训先读取原配置，再逐项覆盖")
     args = parser.parse_args()
+    if args.num_gpus is not None and args.num_gpus < 0:
+        parser.error("--num-gpus 必须大于或等于 0。")
     if args.resume and (args.resume_iter is None or args.resume_iter < 1):
         parser.error("--resume 必须配合 --iter N，N 为已保存的正整数轮次。")
     if not args.resume and args.resume_iter is not None:
@@ -169,6 +172,9 @@ if __name__ == "__main__":
         if not isinstance(overrides, dict):
             parser.error("--override-config 必须是按参数分组的 YAML 映射。")
     cfg.apply_overrides(overrides)
+    if args.num_gpus is not None:
+        cfg.experiment_params.num_gpus = args.num_gpus
+        overrides.setdefault('experiment_params', {})['num_gpus'] = args.num_gpus
     if args.max_iters is not None:
         cfg.experiment_params.max_iters = args.max_iters
         overrides.setdefault('experiment_params', {})['max_iters'] = args.max_iters
@@ -199,6 +205,7 @@ if __name__ == "__main__":
         algorithm_overrides = overrides.get('algorithm_params', {})
         def update_resume_config(policy, policy_id):
             policy.config.update(algorithm_config)
+            policy.config['num_gpus'] = cfg.experiment_params.num_gpus
             policy.config['env_config'] = env_config
             policy.config['model']['custom_model_config'] = network_config
             if 'lr' in algorithm_overrides:
