@@ -36,9 +36,9 @@ def sample_free_position(world, robot, *, free=True, filter_start_goal=False,
         for obj in others:
             if obj.role == 'robot' and obj.position is not None and obj.goal is not None:
                 other_positions.extend([obj.position[:2, 0].copy(), obj.goal[:2, 0].copy()])
-    circle = GeometryFactory.create_geometry(name='circle', radius=check_radius)
+    circle = GeometryFactory.create_geometry(name='circle', radius=max(check_radius, float(robot.radius)))
     for _ in range(max_attempts):
-        position = world._env_param.rng.uniform(low, high)
+        position = world.env_param.rng.uniform(low, high)
         if free:
             geometry = circle.step(position)
             if any(shapely.intersects(geometry, obj._geometry) for obj in others):

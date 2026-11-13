@@ -14,8 +14,10 @@ def lidar_to_pointcloud(lidar_data, min_range: float = 0.2) -> np.ndarray:
     # 计算每个激光束的角度
     angles = angle_min + np.arange(len(ranges)) * angle_increment
     
-    # 过滤掉无效或小于最小距离的激光束
-    mask = np.isfinite(ranges) & (ranges > min_range)
+    # 过滤掉无效、小于最小距离或没有命中的激光束。
+    mask = np.isfinite(ranges) & (ranges >= min_range)
+    if 'valid' in lidar_data:
+        mask &= np.asarray(lidar_data['valid'], dtype=bool)
     ranges = ranges[mask]
     angles = angles[mask]
     

@@ -250,6 +250,8 @@ class MARL_SIM(SIM_ENV):
         R = self._rot_from_prior(self.robot_last_prior_dir[id])
         # ===== 2) neighbor_obs: 以当前机器人为中心的邻居 [rel_x, rel_y, rel_goal_x, rel_goal_y] =====
         neighbor_feats = []
+        # 容忍 float32 坐标和旋转在范围边界上的舍入误差。
+        bounds_eps = np.finfo(np.float32).eps * self.world_scale
         for j, other in enumerate(self.robot_list):
             if j == id:
                 continue
@@ -258,14 +260,14 @@ class MARL_SIM(SIM_ENV):
 
             dist = np.linalg.norm(other_pos - robot_pos)
             rel_vec = other_pos - robot_pos
-            # 在sdf范围内 
-            if self.esdf_cfg.x_min <= rel_vec[0] <= self.esdf_cfg.x_max and \
-                self.esdf_cfg.y_min <= rel_vec[1] <= self.esdf_cfg.y_max:
+            rel_vec = self._rot_vecs(rel_vec.reshape(1, 2), R)[0]
+            # 在先验对齐的 sdf 范围内
+            if self.esdf_cfg.x_min - bounds_eps <= rel_vec[0] <= self.esdf_cfg.x_max + bounds_eps and \
+                self.esdf_cfg.y_min - bounds_eps <= rel_vec[1] <= self.esdf_cfg.y_max + bounds_eps:
                 # 这里用“相对于当前机器人位置”的相对坐标, 同时进行缩放
-                rel_pos = other_pos - robot_pos
+                rel_pos = rel_vec
                 rel_goal = other_goal - robot_pos
                 # rotate to the local frame
-                rel_pos = self._rot_vecs(rel_pos.reshape(1, 2), R)[0]
                 rel_goal = self._rot_vecs(rel_goal.reshape(1, 2), R)[0]
                 rel_pos_norm = rel_pos / self.world_scale
                 rel_goal_norm = rel_goal / self.world_scale
@@ -289,9 +291,8 @@ class MARL_SIM(SIM_ENV):
 
         # ===== 3) ESDF/SDF 观测 =====
         scan = robot.lidar.get_scan().copy()
-        # 保留已有策略的点云角度接口，物理射线和测距使用新版加速实现。
-        scan['angle_increment'] = (scan['angle_max'] - scan['angle_min']) / len(scan['ranges'])
-        pointcloud = lidar_to_pointcloud(scan)
+        # 使用新版原生射线角度、命中掩码和配置的最小量程。
+        pointcloud = lidar_to_pointcloud(scan, min_range=scan['range_min'])
         if pointcloud.size > 0:
             # LiDAR 坐标 -> 世界坐标中的相对点 -> 先验方向对齐坐标。
             sensor_pose = robot.lidar.lidar_origin
@@ -389,12 +390,17 @@ class MARL_SIM(SIM_ENV):
         best = float("inf")
 
         for obs in self.obstacle_list:
-            # 兼容：shape 可能是 dict 或对象
+            # 兼容：shape 可能是字符串、dict 或对象
             shape = getattr(obs, "shape", None)
             if shape is None:
                 continue
 
-            if isinstance(shape, dict):
+            if isinstance(shape, str):
+                name   = shape
+                radius = getattr(obs, "radius", None)
+                length = getattr(obs, "length", None)
+                width  = getattr(obs, "width", None)
+            elif isinstance(shape, dict):
                 name   = shape.get("name", "")
                 radius = shape.get("radius", None)
                 length = shape.get("length", None)
@@ -916,7 +922,10 @@ class MARL_SIM(SIM_ENV):
             self.robot_last_goal_dist[i] = float(dis)
 
             min_clear, _, _ = self._min_surface_clearance_static(i)
-            self.robot_last_obst_loss[i] = min_clear
+            # 与 step 中的 loss_clear 保持相同的无量纲风险，避免首步伪变化。
+            self.robot_last_obst_loss[i] = float(np.clip(
+                (self.reward_cfg.clear_safe - min_clear) /
+                max(self.reward_cfg.clear_safe - self.reward_cfg.clear_danger, 1e-6), 0.0, 1.0))
 
             T0, prior0 = self._compute_travel_time_and_prior_dir(positions[i], goals[i])
             self.robot_last_T[i] = float(T0)
