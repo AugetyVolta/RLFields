@@ -7,6 +7,7 @@ import numpy as np
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.models import ModelCatalog
+from ray.tune.logger import NoopLogger
 
 from model.policy_value_network import RLFieldsActorModel
 from env.multi_robot_env import MultiRobotEnv
@@ -306,7 +307,8 @@ def main():
     ray.init(num_cpus=args.cpus, log_to_driver=False, ignore_reinit_error=True)
     config = build_ppo_config_multiagent(cfg).env_runners(num_env_runners=0, num_envs_per_env_runner=1, num_cpus_per_env_runner=args.cpus)
     config = config.resources(num_gpus=1 if args.device == "cuda" else 0, num_cpus_for_main_process=args.cpus)
-    algo = config.build()
+    # 评测结果由脚本输出，不创建默认的 ~/ray_results 日志。
+    algo = config.build(logger_creator=lambda c: NoopLogger(c, os.path.abspath(args.log_dir)))
     algo.restore(ckpt_path)
     if algo.iteration != args.iter:
         actual_iteration = algo.iteration

@@ -5,6 +5,8 @@ https://github.com/ray-project/ray/blob/ray-2.51.1/rllib/policy/torch_policy_v2.
 PPO loss and optimizer order are inherited unchanged.
 """
 import torch
+from ray.rllib.algorithms import registry as policy_registry
+from ray.rllib.algorithms.ppo import ppo_torch_policy
 from ray.rllib.algorithms.ppo.ppo_torch_policy import PPOTorchPolicy
 from ray.rllib.policy.torch_policy import _directStepOptimizerSingleton
 from ray.rllib.utils.metrics import NUM_GRAD_UPDATES_LIFETIME, DIFF_NUM_GRAD_UPDATES_VS_SAMPLER_POLICY
@@ -151,3 +153,9 @@ class RLFieldsPPOTorchPolicy(PPOTorchPolicy):
         batch_fetches.update(self.extra_compute_grad_fetches())
 
         return batch_fetches
+
+
+# The legacy policy registry resolves names inside ray.rllib.algorithms.
+# Expose our additional class name while retaining the native PPO policy.
+ppo_torch_policy.RLFieldsPPOTorchPolicy = RLFieldsPPOTorchPolicy
+policy_registry.POLICIES["RLFieldsPPOTorchPolicy"] = "ppo.ppo_torch_policy"

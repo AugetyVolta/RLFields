@@ -181,6 +181,10 @@ logs/pgrl_random_env/
 └── tensorboard/               # TensorBoard events and training logs
 ```
 
+Training writes its Ray result logs to the experiment's `tensorboard/` directory. Evaluation disables the default Ray result logger, so it does not create extra `~/ray_results` runs; metrics are still printed and saved when `--out-json` is supplied.
+
+The project registers its custom PPO policy when the `model` package is imported, allowing checkpoints to record its policy name. Keep the project code available when restoring a checkpoint.
+
 A checkpoint is saved after each iteration and at the end of training. In-place resuming writes its configuration to `scene_config_resume.yaml` and retains the original configuration snapshot.
 
 ```bash
