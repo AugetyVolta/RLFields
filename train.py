@@ -8,6 +8,8 @@ from dataclasses import asdict
 import ray
 from ray.rllib.algorithms.ppo import PPOConfig
 from model.policy_value_network import RLFieldsActorModel
+from model.learner_policy import RLFieldsPPOTorchPolicy
+from ray.rllib.policy.policy import PolicySpec
 from ray.rllib.models import ModelCatalog
 from ray.tune.logger import UnifiedLogger
 from env.multi_robot_env import MultiRobotEnv
@@ -77,7 +79,7 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
             grad_clip=cfg.algorithm_params.grad_clip,
         )
         .multi_agent(
-            policies={"shared_policy"},
+            policies={"shared_policy": PolicySpec(policy_class=RLFieldsPPOTorchPolicy)},
             policy_mapping_fn=lambda agent_id, *args, **kwargs: "shared_policy",
         )
         .resources(

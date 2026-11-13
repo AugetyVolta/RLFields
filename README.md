@@ -112,6 +112,8 @@ CUDA_VISIBLE_DEVICES=0,1 python train.py --env random_env --num-gpus 2
 
 The default remains one learner GPU. `experiment_params.num_gpus` can also be set in `env/params.py` or an override YAML; the command-line value takes precedence, including when resuming. Saved checkpoints retain the effective setting. Increasing the GPU count does not change the configured PPO minibatch size or number of epochs.
 
+With multiple learner GPUs, minibatch updates synchronize trainable parameters and buffers while reusing the frozen planner weights on each GPU. A full synchronization runs on the first update and after restoring weights. Single-GPU training uses RLlib's native update; the PPO loss and model architecture are unchanged.
+
 Set sampling-worker CPU/GPU allocations in `experiment_params` to fit the machine. Multiple environments within a worker are stepped sequentially, with policy inference batched across agents.
 
 ### Resume training
