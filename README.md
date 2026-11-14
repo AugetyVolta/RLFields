@@ -13,7 +13,8 @@
   <a href="#installation">Installation</a> &nbsp;|&nbsp;
   <a href="#training">Training</a> &nbsp;|&nbsp;
   <a href="#evaluation">Evaluation</a> &nbsp;|&nbsp;
-  <a href="#citation">Citation</a>
+  <a href="#citation">Citation</a> &nbsp;|&nbsp;
+  <a href="#license">License</a>
 </p>
 
 </div>
@@ -274,6 +275,12 @@ python tools/migrate_checkpoint.py --checkpoint /path/to/checkpoint --output-dir
 The converter creates a copy with the current module and configuration names, preserving weights, optimizer state, and iteration counters. Use `--rename-key OLD=NEW` if it reports a renamed configuration field. Conversion requires a compatible model architecture.
 
 </details>
+
+## License
+
+The original PGRL-Nav source code is released under the [MIT License](LICENSE).
+Third-party components retain their respective licenses; see
+[Third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Citation
 
