@@ -60,7 +60,7 @@ config/
 
 `--env` selects a **directory under `config/`**, such as `--env random_env_1`. Each environment directory must contain one scene YAML with `world` and `robot` sections and one matching planner checkpoint (`.pt`, `.pth`, or `.ckpt`). Filenames may differ from the directory name. Additional maps can use the same directory structure.
 
-The supplied planner weights are used to construct navigation priors. Trained navigation-policy checkpoints are produced separately by `train.py`.
+The global planning prior uses [PC-Planner](https://github.com/fishcrap/pc-planner) (Shen et al., SIGGRAPH Asia 2024; [paper](https://arxiv.org/abs/2410.12805)). The supplied planner weights are used to construct navigation priors. Trained navigation-policy checkpoints are produced separately by `train.py`.
 
 ## Training
 
@@ -136,35 +136,93 @@ By default, resumed training appends to the original experiment. Use a new `--ou
 
 ## Evaluation
 
-Evaluate a trained policy with 20 robots and save the metrics:
+Run the commands below from the repository root, with the `pgrl` environment activated. Evaluation restores a saved policy without training or updating its weights.
+
+### Choose the experiment and checkpoint
+
+`--log-dir` is the **training experiment directory**, containing `scene_config.yaml`, `env.yaml`, `ntfields.pt`, and `ckpts/`. It is not the environment configuration directory or a checkpoint subdirectory. Replace `logs/pgrl_random_env` below with your actual experiment directory.
+
+List the available checkpoints:
+
+```bash
+ls logs/pgrl_random_env/ckpts
+```
+
+For example, `iter_000200` corresponds to `--iter 200`. Use an iteration that has already been saved; the examples below load `logs/pgrl_random_env/ckpts/iter_000200`.
+
+### Parallel metrics evaluation
+
+This example evaluates **20 robots for 100 episodes in total**, using **2 Ray runner processes with 2 environments each**:
+
+```bash
+python evaluate_metrics.py \
+  --log-dir logs/pgrl_random_env --iter 200 \
+  --num-robots 20 --episodes 100 --max-steps 5000 \
+  --device cpu --cpus 4 \
+  --num-env-runners 2 --num-envs-per-env-runner 2 \
+  --num-cpus-per-env-runner 1 --num-gpus-per-env-runner 0 \
+  --rollout-fragment-length 150 --sample-timeout-s none \
+  --out-json results_n20.json
+```
+
+Change `--num-robots` to evaluate another team size, such as 40, and choose a different output filename to keep both results. `--episodes 100` is shared across the runners, not repeated 100 times per runner.
+
+`--num-env-runners` controls the number of parallel processes. Within each process, `--num-envs-per-env-runner` environments use batched policy inference and advance synchronously. Start with the example above; increase the runner count when more CPU and memory are available. `--cpus` must be at least `num-env-runners × num-cpus-per-env-runner`. The per-runner CPU setting is a Ray resource reservation, not a simulator thread count.
+
+Results are printed in the terminal. `results_n20.json` is written to the current working directory and contains `episodes` (individual results), `summary` (aggregate metrics), and `evaluation_config` (checkpoint, team size, runner settings, and actual runner process IDs). For a custom `--out-json` path, its parent directory must already exist.
+
+### Single-process metrics evaluation
+
+For a quick check, use one local environment and fewer episodes:
 
 ```bash
 python evaluate_metrics.py --log-dir logs/pgrl_random_env --iter 200 \
-  --num-robots 20 --episodes 100 --max-steps 5000 --out-json results.json
+  --num-robots 20 --episodes 5 --device cpu \
+  --num-env-runners 0 --num-envs-per-env-runner 1 \
+  --out-json results_n20_quick.json
 ```
 
-Visualize navigation:
+The defaults are local evaluation (`--num-env-runners 0`) and one environment. Parallel evaluation is enabled explicitly with a positive runner count.
+
+### Visualize navigation
 
 ```bash
 python evaluate.py --log-dir logs/pgrl_random_env --iter 200 \
   --num-robots 20 --episodes 2 --max-steps 5000 --render
 ```
 
-Both scripts restore the map, planner, and model configuration from the experiment directory. Omit `--num-robots` to use the training team size. Omit `--render` for headless evaluation, or add `--device cpu` for CPU execution.
+Both scripts restore the map, planner, and model configuration from the experiment directory. Omit `--num-robots` to use the training team size. Omit `--render` for headless evaluation. Rendering in `evaluate_metrics.py` requires `--num-env-runners 0 --num-envs-per-env-runner 1`.
+
+### Evaluation arguments
 
 | Argument | Description |
 | --- | --- |
 | `--log-dir` | Training experiment directory; required |
-| `--iter` | Saved training iteration; required |
+| `--iter` | Saved training iteration; required; `200` loads `ckpts/iter_000200` |
 | `--num-robots` | Evaluation team size; defaults to the saved training value |
-| `--episodes` | Evaluation episodes; defaults to 20 for metrics and 2 for visualization |
+| `--episodes` | Total evaluation episodes across all runners; defaults to 20 for metrics and 2 for visualization |
 | `--max-steps` | Per-episode step limit; defaults to 5000 |
-| `--device` | `cuda` or `cpu`; defaults to CUDA when available |
-| `--cpus` | Ray CPU allocation; defaults to 8 |
+| `--device` | `cpu` or `cuda`; local evaluation defaults to CUDA when available. Metrics evaluation with remote runners defaults to CPU unless GPU resources are requested |
+| `--cpus` | Total Ray CPU allocation; defaults to 8 |
 | `--render` | Enable visualization |
-| `--out-json` | Output file for `evaluate_metrics.py` |
+| `--out-json` | Output JSON file for `evaluate_metrics.py`; omitted by default |
 
-The metrics output contains per-episode results, aggregate statistics, and the evaluation configuration. Reported statistics include team and agent success rates, path length, return, speed, and episode length. The per-robot task timeout from the saved configuration remains active alongside `--max-steps`.
+The following options apply to **`evaluate_metrics.py` only**. Both hyphenated and underscored spellings are accepted (for example, `--num-env-runners` and `--num_env_runners`).
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--num-env-runners` | `0` | Remote runner processes; `0` evaluates locally |
+| `--num-envs-per-env-runner` | `1` | Environments per runner, with batched inference and synchronous stepping |
+| `--num-cpus-per-env-runner` | `1` | Logical CPU resources reserved per remote runner |
+| `--num-gpus-per-env-runner` | `0` | GPU resources reserved per remote runner; fractional values are supported |
+| `--rollout-fragment-length` | Saved experiment setting | Environment steps advanced per sampling chunk; accepts a positive integer or `auto` |
+| `--sample-timeout-s` | `none` | Wait limit in seconds per remote sampling chunk; `none` means unlimited; not applicable to local evaluation |
+
+For GPU evaluation with remote runners, set `--device cuda` and a positive `--num-gpus-per-env-runner`; the total requested runner GPU resources must fit the GPUs visible to Ray. Fractional GPU values describe scheduling reservations.
+
+`--rollout-fragment-length` controls sampling chunks, not episode length. The per-robot task timeout from the saved configuration remains active alongside `--max-steps`. A remote sampling timeout fails the evaluation instead of reporting incomplete episodes as a completed run.
+
+Reported statistics include team and agent success rates, path length, return, speed, and episode length.
 
 ## Experiment outputs
 
@@ -228,5 +286,18 @@ If you use PGRL-Nav in your research, please cite:
   booktitle = {2026 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
   year      = {2026},
   pages     = {15176--15183}
+}
+```
+
+Please also cite PC-Planner, which provides the neural global planning prior used in this project:
+
+```bibtex
+@inproceedings{shen2024pc,
+  title     = {{PC-Planner}: Physics-Constrained Self-Supervised Learning for Robust Neural Motion Planning with Shape-Aware Distance Function},
+  author    = {Shen, Xujie and Peng, Haocheng and Yang, Zesong and Xu, Juzhan and Bao, Hujun and Hu, Ruizhen and Cui, Zhaopeng},
+  booktitle = {SIGGRAPH Asia 2024 Conference Papers},
+  year      = {2024},
+  pages     = {1--11},
+  doi       = {10.1145/3680528.3687651}
 }
 ```

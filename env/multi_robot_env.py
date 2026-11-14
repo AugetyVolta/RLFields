@@ -1,6 +1,7 @@
 import numpy as np
 from gymnasium.spaces import Box
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
 from .params import SceneConfig
 from .sim.marl_sim_env import MARL_SIM
 
@@ -66,3 +67,25 @@ class MultiRobotEnv(MultiAgentEnv):
     def close(self):
         # 绘图时 plt.pause(0) 会无限等待，使用正数以正常退出。
         self.sim.env.close(ending_time=0.001)
+
+class NavigationMetricsCallbacks(DefaultCallbacks):
+    """将训练回合的导航指标交给 RLlib 汇总并写入 TensorBoard。"""
+    def on_episode_end(self, *, episode, **kwargs):
+        infos = [episode.last_info_for(agent_id) for agent_id in episode.get_agents()]
+        n = len(infos)
+        robot_collisions = [info["r_coll_robot"] < 0 for info in infos]
+        static_collisions = [info["r_coll_obst"] < 0 for info in infos]
+        collisions = [robot or static for robot, static in zip(robot_collisions, static_collisions)]
+        timeouts = [info["r_timeout"] < 0 for info in infos]
+        arrivals = [
+            info["r_arrive"] > 0 and not collision and not timeout
+            for info, collision, timeout in zip(infos, collisions, timeouts)
+        ]
+        episode.custom_metrics.update({
+            "PSR": sum(arrivals) / n,
+            "TSR": float(all(arrivals)),
+            "Coll": sum(collisions) / n,
+            "CollRobot": sum(robot_collisions) / n,
+            "CollStatic": sum(static_collisions) / n,
+            "Timeout": sum(timeouts) / n,
+        })

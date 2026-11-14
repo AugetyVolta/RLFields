@@ -14,8 +14,9 @@ from ray.rllib.policy.policy import PolicySpec
 from ray.rllib.models import ModelCatalog
 from ray.tune.logger import UnifiedLogger
 from ray.util.annotations import RayDeprecationWarning
-from env.multi_robot_env import MultiRobotEnv
+from env.multi_robot_env import MultiRobotEnv, NavigationMetricsCallbacks
 from env.params import SceneConfig
+from utils.periodic_dev import launch_dev_evaluation
 
 def get_experiment_name(prefix: str = "multi_robot_ppo") -> str:
     # 形如 multi_robot_ppo_20251124_153045
@@ -93,6 +94,7 @@ def build_ppo_config_multiagent(cfg: SceneConfig):
             num_gpus=cfg.experiment_params.num_gpus,
             num_cpus_for_main_process=cfg.experiment_params.num_cpus_for_main_process
         )
+        .callbacks(NavigationMetricsCallbacks)
     )
     return config
 
@@ -232,11 +234,15 @@ if __name__ == "__main__":
                 policy.kl_coeff = cfg.algorithm_params.kl_coeff
         algo.env_runner_group.foreach_env_runner(lambda worker: worker.foreach_policy(update_resume_config))
 
+    dev_processes = []
     for it in range(resume_it, cfg.experiment_params.max_iters):
         result = algo.train()
 
         iter_ckpt_root = os.path.join(exp_info["ckpt_dir"], f"iter_{it + 1:06d}")
         algo.save(iter_ckpt_root)
+        dev_process = launch_dev_evaluation(exp_info["exp_dir"], it + 1)
+        if dev_process is not None:
+            dev_processes.append((it + 1, dev_process))
         print(f"[{exp_info['exp_name']}] iter={it + 1} "
               f"time={result['time_this_iter_s']:.2f}s checkpoint={iter_ckpt_root}", flush=True)
 
@@ -247,3 +253,7 @@ if __name__ == "__main__":
 
     algo.stop()
     ray.shutdown()
+
+    failed_dev = [iteration for iteration, process in dev_processes if process.wait() != 0]
+    if failed_dev:
+        raise RuntimeError(f"DEV evaluation failed at iterations {failed_dev}; see evaluation/iter_*.log")
